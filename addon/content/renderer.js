@@ -1,16 +1,18 @@
-// Runs inside a hidden, system-principal iframe in the Zotero main window.
-// Renders PDF pages to JPEG using the pdf.js build that ships with Zotero's reader,
-// so rendering matches what the user sees and nothing extra has to be bundled.
-import * as pdfjsLib from "resource://zotero/reader/pdf/build/pdf.mjs";
+// Runs inside a content-privileged <browser> (origin resource://zotero-topk), NOT with chrome
+// privileges: a malformed PDF can only reach this page and its worker. The privileged side
+// (src/renderer.ts) reads the file, hands the bytes in, and receives page images back through
+// an exported callback. pdf.js is bundled with the plugin (content/pdfjs/) so everything the
+// parser fetches is same-origin.
+import * as pdfjsLib from "./pdfjs/pdf.mjs";
 
-const PDF_BASE = "resource://zotero/reader/pdf/";
+const PDF_BASE = new URL("./pdfjs/", import.meta.url).href;
 let workerPort = null;
 
 function ensureWorker() {
 	if (!workerPort) {
 		// Create the worker ourselves (and hand pdf.js the port) so pdf.js does not try
 		// its same-origin / CDN-wrapper logic against the resource:// URL.
-		workerPort = new Worker(PDF_BASE + "build/pdf.worker.mjs", { type: "module" });
+		workerPort = new Worker(PDF_BASE + "pdf.worker.mjs", { type: "module" });
 		pdfjsLib.GlobalWorkerOptions.workerPort = workerPort;
 	}
 }
@@ -56,22 +58,26 @@ async function encodeJpeg(canvas, quality, maxBytes) {
 	throw new Error("could not fit page image under " + maxBytes + " bytes");
 }
 
-async function renderPdf(path, opts, onPage) {
+/**
+ * @param data     Uint8Array with the PDF bytes (cloned into this window by the caller)
+ * @param opts     { maxEdge, quality, maxBytes, maxPages, concurrency, isCancelled() }
+ * @param onPage   callback(pageInfo) -> Promise, exported from the privileged side
+ */
+async function renderPdf(data, opts, onPage) {
 	ensureWorker();
-	const maxEdge = opts.maxEdge || 1536;
-	const quality = (opts.quality || 85) / 100;
+	const maxEdge = Math.max(256, Math.min(4096, opts.maxEdge || 1536));
+	const quality = Math.max(0.3, Math.min(1, (opts.quality || 85) / 100));
 	const maxBytes = opts.maxBytes || 500 * 1024;
-	const maxPages = opts.maxPages || Infinity;
+	const maxPages = Math.max(1, opts.maxPages || 500);
 	const concurrency = Math.max(1, Math.min(16, opts.concurrency || 8));
-	const data = await IOUtils.read(path);
+	const isCancelled = typeof opts.isCancelled === "function" ? opts.isCancelled : () => false;
 	const task = pdfjsLib.getDocument({
 		data,
-		cMapUrl: PDF_BASE + "web/cmaps/",
+		cMapUrl: PDF_BASE + "cmaps/",
 		cMapPacked: true,
-		standardFontDataUrl: PDF_BASE + "web/standard_fonts/",
-		wasmUrl: PDF_BASE + "web/wasm/",
-		iccUrl: PDF_BASE + "web/iccs/",
-		isEvalSupported: false,
+		standardFontDataUrl: PDF_BASE + "standard_fonts/",
+		wasmUrl: PDF_BASE + "wasm/",
+		iccUrl: PDF_BASE + "iccs/",
 		verbosity: 0,
 	});
 	const doc = await task.promise;
@@ -80,7 +86,7 @@ async function renderPdf(path, opts, onPage) {
 	let next = 1;
 	let rendered = 0;
 	let failure = null;
-	const cancelled = () => failure || (opts.signal && opts.signal.cancelled);
+	const cancelled = () => failure || isCancelled();
 
 	// Each lane owns one canvas and pulls page numbers from a shared counter, so
 	// worker-side parsing, main-thread painting and JPEG encoding overlap across pages.
@@ -140,4 +146,4 @@ async function renderPdf(path, opts, onPage) {
 	return { rendered, total };
 }
 
-window.TopKRenderer = { version: 1, renderPdf };
+window.TopKRenderer = { version: 2, renderPdf };

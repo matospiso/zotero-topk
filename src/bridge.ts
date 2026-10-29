@@ -39,6 +39,35 @@ export class BridgeError extends Error {
 
 const { Subprocess } = ChromeUtils.importESModule("resource://gre/modules/Subprocess.sys.mjs");
 
+// Region and host are interpolated into https://<region>.api.<host>; accept hostname syntax only.
+const HOST_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/;
+const HOST_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
+const COLLECTION_NAME = /^[A-Za-z0-9_-]{1,128}$/;
+// Environment variables the helper legitimately needs (everything else from Zotero's environment is withheld).
+const CHILD_ENV_ALLOWLIST = [
+	"PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
+	"SystemRoot", "SYSTEMROOT", "windir", "COMSPEC", "APPDATA", "LOCALAPPDATA", "ProgramFiles", "ProgramData",
+	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+];
+
+/** Cryptographically random token (hex) for the loopback channel. */
+function randomToken(bytes = 32): string {
+	const gen = Components.classes["@mozilla.org/security/random-generator;1"]
+		.getService(Components.interfaces.nsIRandomGenerator);
+	const buf: number[] = Array.from(gen.generateRandomBytes(bytes));
+	return buf.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function childEnvironment(extra: Record<string, string>): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const name of CHILD_ENV_ALLOWLIST) {
+		const v = Services.env.get(name);
+		if (v) env[name] = v;
+	}
+	return { ...env, ...extra };
+}
+
 /**
  * Manages the local Node.js helper that hosts the TopK JavaScript SDK and
  * exposes a tiny JSON API on 127.0.0.1.
@@ -88,6 +117,9 @@ export class Bridge {
 		if (!fake && !apiKey) {
 			throw new BridgeError("No TopK API key set. Open Settings → TopK Semantic Search and paste your API key.");
 		}
+		if (!HOST_LABEL.test(region)) throw new BridgeError(`Invalid TopK region “${region}”: use a region name such as aws-us-east-1-elastica.`);
+		if (host && !HOST_NAME.test(host)) throw new BridgeError(`Invalid TopK host “${host}”: use a hostname such as topk.io.`);
+		if (!COLLECTION_NAME.test(collection)) throw new BridgeError("Invalid collection name: use letters, digits, “-” and “_” only.");
 		const key = JSON.stringify([apiKey, region, collection, host]);
 		if (this.configured && this.configKey === key) return;
 		const res = await this.request("POST", "/configure", { apiKey, region, collection, host: host || undefined });
@@ -259,7 +291,7 @@ export class Bridge {
 	private async prepareBridgeDir(): Promise<string> {
 		const dir = PathUtils.join(Zotero.DataDirectory.dir, "topk-bridge");
 		await IOUtils.makeDirectory(dir, { ignoreExisting: true });
-		for (const name of ["server.js", "package.json"]) {
+		for (const name of ["server.js", "package.json", "package-lock.json"]) {
 			// getResourceAsync goes through an nsIChannel, so it also works for jar: URLs (installed xpi).
 			const src = await Zotero.File.getResourceAsync(`${this.rootURI}bridge/${name}`);
 			await IOUtils.writeUTF8(PathUtils.join(dir, name), src);
@@ -271,7 +303,7 @@ export class Bridge {
 		const dir = this.bridgeDir;
 		const stamp = PathUtils.join(dir, ".installed");
 		const pkgJson = JSON.parse(await IOUtils.readUTF8(PathUtils.join(dir, "package.json")));
-		const want = `${this.pluginVersion}:${pkgJson.dependencies["topk-js"]}`;
+		const want = `${this.pluginVersion}:${pkgJson.dependencies["topk-js"]}:ci`;
 		const haveModule = await this.fileExists(PathUtils.join(dir, "node_modules", "topk-js", "package.json"));
 		let have = "";
 		try { have = (await IOUtils.readUTF8(stamp)).trim(); } catch (e) {}
@@ -289,7 +321,9 @@ export class Bridge {
 			command = npm;
 			args = [];
 		}
-		args.push("install", "--omit=dev", "--no-audit", "--no-fund", "--loglevel=error");
+		// `ci` installs exactly what the shipped lockfile pins (with integrity checks) and fails on any drift;
+		// the SDK ships prebuilt binaries as optional platform packages, so lifecycle scripts are not needed.
+		args.push("ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error");
 
 		log(`installing bridge dependencies in ${dir}`);
 		const pw = new Zotero.ProgressWindow({ closeOnClick: false });
@@ -297,7 +331,10 @@ export class Bridge {
 		pw.addDescription("Installing the TopK SDK for the local helper (one-time, needs network)…");
 		pw.show();
 		try {
-			const proc = await Subprocess.call({ command, arguments: args, workdir: dir, stderr: "stdout" });
+			const proc = await Subprocess.call({
+				command, arguments: args, workdir: dir, stderr: "stdout",
+				environment: childEnvironment({}), environmentAppend: false,
+			});
 			let out = "";
 			let chunk: string;
 			while ((chunk = await proc.stdout.readString())) out += chunk;
@@ -318,16 +355,16 @@ export class Bridge {
 	// ----------------------------------------------------------------------
 
 	private async spawn(): Promise<void> {
-		this.token = Zotero.Utilities.randomString(40);
+		this.token = randomToken(32);
 		const fake = getPref<boolean>("bridgeFake", false);
-		const environment: Record<string, string> = { TOPK_BRIDGE_TOKEN: this.token };
-		if (fake) environment.TOPK_BRIDGE_FAKE = "1";
+		const extra: Record<string, string> = { TOPK_BRIDGE_TOKEN: this.token };
+		if (fake) extra.TOPK_BRIDGE_FAKE = "1";
 		const proc = await Subprocess.call({
 			command: this.nodePath,
 			arguments: [PathUtils.join(this.bridgeDir, "server.js")],
 			workdir: this.bridgeDir,
-			environment,
-			environmentAppend: true,
+			environment: childEnvironment(extra),
+			environmentAppend: false,
 			stderr: "pipe",
 		});
 		this.proc = proc;
@@ -349,9 +386,13 @@ export class Bridge {
 			let buf = "";
 			let chunk: string;
 			while ((chunk = await proc.stdout.readString())) {
-				buf += chunk;
-				const m = buf.match(/TOPK_BRIDGE_READY (\{.*\})/);
-				if (m) return JSON.parse(m[1]);
+				buf = (buf + chunk).slice(-16384);
+				const m = buf.match(/TOPK_BRIDGE_READY (\{[^\n]*\})/);
+				if (m) {
+					const info = JSON.parse(m[1]);
+					if (!Number.isInteger(info.port) || info.port <= 0 || info.port > 65535) throw new BridgeError("bridge reported an invalid port");
+					return info;
+				}
 			}
 			throw new BridgeError("bridge exited before becoming ready");
 		})();
@@ -369,7 +410,10 @@ export class Bridge {
 		this.info = { version: info.version, fake: !!info.fake };
 		log(`bridge ready on 127.0.0.1:${this.port} (v${info.version}${info.fake ? ", fake" : ""})`);
 
-		// Keep draining stdout; note unexpected exits.
+		// Keep draining stdout so the pipe can never fill up; note unexpected exits.
+		(async () => {
+			try { while (await proc.stdout.readString()) { /* discard */ } } catch (e) {}
+		})();
 		proc.wait().then(({ exitCode }: { exitCode: number }) => {
 			if (this.proc === proc) {
 				log(`bridge exited with code ${exitCode}`);
@@ -437,6 +481,11 @@ export class Bridge {
 		if (!attachmentKeys.length) return;
 		await this.ensureReady();
 		await this.request("POST", "/delete", { libraryID, attachmentKeys });
+	}
+
+	async deleteLibrary(libraryID: number): Promise<void> {
+		await this.ensureReady();
+		await this.request("POST", "/delete-library", { libraryID });
 	}
 
 	async manifest(libraryID: number): Promise<{ rows: ManifestRow[]; complete: boolean }> {

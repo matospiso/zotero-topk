@@ -11,17 +11,42 @@
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const { version: BRIDGE_VERSION } = require("./package.json");
 
 const TOKEN = process.env.TOPK_BRIDGE_TOKEN || "";
 const FAKE = process.env.TOPK_BRIDGE_FAKE === "1";
 const PORT = Number(process.env.TOPK_BRIDGE_PORT || 0);
 const MAX_BODY = 64 * 1024 * 1024;
+const MAX_MANIFEST_ROWS = 50000;
+const MAX_ERROR_TEXT = 500;
 const SEARCH_FIELDS = ["library_id", "attachment_key", "item_key", "page", "page_count", "title"];
+// Region / host are interpolated into https://<region>.api.<host> by the SDK: allow hostname labels only.
+const HOST_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/;
+const HOST_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
+const COLLECTION_NAME = /^[A-Za-z0-9_-]{1,128}$/;
 
-if (!TOKEN) {
-	console.error("TOPK_BRIDGE_TOKEN is required");
+if (TOKEN.length < 32) {
+	console.error("TOPK_BRIDGE_TOKEN is required (at least 32 characters)");
 	process.exit(2);
+}
+// Constant-time bearer check: compare fixed-length digests so neither token length nor content leaks via timing.
+const TOKEN_DIGEST = crypto.createHash("sha256").update(TOKEN).digest();
+function tokenMatches(header) {
+	if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
+	const digest = crypto.createHash("sha256").update(header.slice(7)).digest();
+	return crypto.timingSafeEqual(digest, TOKEN_DIGEST);
+}
+// Only loopback peers are expected; a browser-originated request (DNS rebinding) carries a foreign Host header.
+function hostAllowed(host) {
+	if (typeof host !== "string") return false;
+	const name = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+	return name === "127.0.0.1" || name === "localhost" || name === "::1";
+}
+function asLibraryID(value) {
+	const n = Number(value);
+	if (!Number.isInteger(n) || n < 0) throw new HttpError(400, "libraryID must be a non-negative integer");
+	return n;
 }
 
 function log(...args) {
@@ -107,9 +132,10 @@ class TopKBackend {
 	}
 
 	async configure({ apiKey, region, collection, host }) {
-		if (!apiKey) throw new HttpError(400, "apiKey is required");
-		if (!region) throw new HttpError(400, "region is required");
-		if (!collection) throw new HttpError(400, "collection is required");
+		if (typeof apiKey !== "string" || !apiKey) throw new HttpError(400, "apiKey is required");
+		if (typeof region !== "string" || !HOST_LABEL.test(region)) throw new HttpError(400, "region must be a single hostname label (e.g. aws-us-east-1-elastica)");
+		if (typeof collection !== "string" || !COLLECTION_NAME.test(collection)) throw new HttpError(400, "collection must match [A-Za-z0-9_-]{1,128}");
+		if (host != null && host !== "" && (typeof host !== "string" || !HOST_NAME.test(host))) throw new HttpError(400, "host must be a hostname (e.g. topk.io)");
 		const { Client } = this._sdk();
 		const config = {
 			apiKey,
@@ -203,12 +229,14 @@ class TopKBackend {
 	}
 
 	async deleteAttachments({ libraryID, attachmentKeys }) {
+		const lib = asLibraryID(libraryID);
 		if (!Array.isArray(attachmentKeys) || !attachmentKeys.length) return { ok: true, deleted: 0 };
+		if (!attachmentKeys.every((k) => typeof k === "string" && k.length <= 64)) throw new HttpError(400, "attachmentKeys must be strings");
 		const { field } = this._sdk().query;
 		for (let i = 0; i < attachmentKeys.length; i += 100) {
 			const chunk = attachmentKeys.slice(i, i + 100);
-			let expr = field("attachment_key").in(chunk);
-			if (libraryID != null) expr = field("library_id").eq(Number(libraryID)).and(expr);
+			// Always scoped to one library: a collection-wide delete is never issued.
+			const expr = field("library_id").eq(lib).and(field("attachment_key").in(chunk));
 			const lsn = await withRetry("delete", () => this._col().delete(expr));
 			this.lastLsn = lsn;
 			this.lastLsnAt = Date.now();
@@ -216,20 +244,27 @@ class TopKBackend {
 		return { ok: true, deleted: attachmentKeys.length };
 	}
 
+	/** Remove every page of one library (used when a group library is removed from Zotero). */
+	async deleteLibrary({ libraryID }) {
+		const lib = asLibraryID(libraryID);
+		const { field } = this._sdk().query;
+		const lsn = await withRetry("delete library", () => this._col().delete(field("library_id").eq(lib)));
+		this.lastLsn = lsn;
+		this.lastLsnAt = Date.now();
+		return { ok: true, libraryID: lib };
+	}
+
 	/**
 	 * List what is already indexed (one row per attachment) so a fresh install
 	 * can reconcile with an existing collection instead of re-rendering everything.
 	 */
 	async manifest({ libraryID }) {
+		const lib = asLibraryID(libraryID);
 		const { select, field } = this._sdk().query;
 		const col = this._col();
 		const PAGE = 500;
 		const rows = [];
-		const base = () => {
-			let f = field("page").eq(1);
-			if (libraryID != null) f = f.and(field("library_id").eq(Number(libraryID)));
-			return f;
-		};
+		const base = () => field("page").eq(1).and(field("library_id").eq(lib));
 		const fields = {
 			attachment_key: field("attachment_key"),
 			library_id: field("library_id"),
@@ -244,6 +279,7 @@ class TopKBackend {
 				const docs = await withRetry("manifest", () => col.query(select(fields).filter(f).sort(field("attachment_key"), true).limit(PAGE)), { maxMs: 90000 });
 				rows.push(...docs);
 				if (docs.length < PAGE) break;
+				if (rows.length >= MAX_MANIFEST_ROWS) return { rows, complete: false };
 				last = docs[docs.length - 1].attachment_key;
 			}
 			return { rows, complete: true };
@@ -270,9 +306,13 @@ class FakeBackend {
 		return !!this.collectionName;
 	}
 
-	async configure({ region, collection }) {
-		this.collectionName = collection || "fake";
-		this.region = region || "fake";
+	async configure({ region, collection, host }) {
+		// Same input contract as the real backend, so tests exercise the validation.
+		if (typeof region !== "string" || !HOST_LABEL.test(region)) throw new HttpError(400, "region must be a single hostname label (e.g. aws-us-east-1-elastica)");
+		if (typeof collection !== "string" || !COLLECTION_NAME.test(collection)) throw new HttpError(400, "collection must match [A-Za-z0-9_-]{1,128}");
+		if (host != null && host !== "" && (typeof host !== "string" || !HOST_NAME.test(host))) throw new HttpError(400, "host must be a hostname (e.g. topk.io)");
+		this.collectionName = collection;
+		this.region = region;
 		return { ok: true, created: false, collection: this.collectionName, region: this.region, fake: true };
 	}
 
@@ -281,11 +321,17 @@ class FakeBackend {
 	}
 
 	async upsert({ docs }) {
-		for (const d of docs) this.docs.set(d._id, d);
+		if (!Array.isArray(docs) || !docs.length) throw new HttpError(400, "docs must be a non-empty array");
+		for (const d of docs) {
+			if (!d || typeof d._id !== "string" || typeof d.page_image_b64 !== "string") throw new HttpError(400, "each doc needs _id and page_image_b64");
+			this.docs.set(d._id, d);
+		}
 		return { ok: true, lsn: String(this.docs.size), count: docs.length };
 	}
 
 	async search({ query, limit = 50, libraryIDs }) {
+		if (!query || typeof query !== "string") throw new HttpError(400, "query is required");
+		limit = Math.max(1, Math.min(500, Number(limit) || 50));
 		const terms = String(query).toLowerCase().split(/\W+/).filter(Boolean);
 		const hits = [];
 		for (const d of this.docs.values()) {
@@ -312,9 +358,11 @@ class FakeBackend {
 	}
 
 	async deleteAttachments({ libraryID, attachmentKeys }) {
+		const lib = asLibraryID(libraryID);
+		if (!Array.isArray(attachmentKeys)) throw new HttpError(400, "attachmentKeys must be an array");
 		let deleted = 0;
 		for (const [id, d] of this.docs) {
-			if ((libraryID == null || d.library_id === libraryID) && attachmentKeys.includes(d.attachment_key)) {
+			if (d.library_id === lib && attachmentKeys.includes(d.attachment_key)) {
 				this.docs.delete(id);
 				deleted++;
 			}
@@ -322,10 +370,17 @@ class FakeBackend {
 		return { ok: true, deleted };
 	}
 
+	async deleteLibrary({ libraryID }) {
+		const lib = asLibraryID(libraryID);
+		for (const [id, d] of this.docs) if (d.library_id === lib) this.docs.delete(id);
+		return { ok: true, libraryID: lib };
+	}
+
 	async manifest({ libraryID }) {
+		const lib = asLibraryID(libraryID);
 		const rows = [];
 		for (const d of this.docs.values()) {
-			if (d.page === 1 && (libraryID == null || d.library_id === libraryID)) {
+			if (d.page === 1 && d.library_id === lib) {
 				rows.push({ attachment_key: d.attachment_key, library_id: d.library_id, file_hash: d.file_hash, page_count: d.page_count });
 			}
 		}
@@ -346,6 +401,7 @@ const ROUTES = {
 	"POST /search": (body) => backend.search(body),
 	"POST /images": (body) => backend.images(body),
 	"POST /delete": (body) => backend.deleteAttachments(body),
+	"POST /delete-library": (body) => backend.deleteLibrary(body),
 	"POST /manifest": (body) => backend.manifest(body),
 	"POST /shutdown": async () => {
 		setTimeout(() => process.exit(0), 50);
@@ -383,8 +439,8 @@ function send(res, status, obj) {
 
 const server = http.createServer(async (req, res) => {
 	try {
-		const auth = req.headers.authorization || "";
-		if (auth !== `Bearer ${TOKEN}`) throw new HttpError(401, "unauthorized");
+		if (!tokenMatches(req.headers.authorization)) throw new HttpError(401, "unauthorized");
+		if (!hostAllowed(req.headers.host)) throw new HttpError(403, "forbidden host");
 		const url = new URL(req.url, "http://127.0.0.1");
 		const handler = ROUTES[`${req.method} ${url.pathname}`];
 		if (!handler) throw new HttpError(404, `no route ${req.method} ${url.pathname}`);
@@ -398,6 +454,7 @@ const server = http.createServer(async (req, res) => {
 				catch (e) {
 					throw new HttpError(400, "invalid JSON body");
 				}
+				if (!body || typeof body !== "object" || Array.isArray(body)) throw new HttpError(400, "body must be a JSON object");
 			}
 		}
 		const result = await handler(body);
@@ -406,7 +463,9 @@ const server = http.createServer(async (req, res) => {
 	catch (e) {
 		const status = e instanceof HttpError ? e.status : 500;
 		if (status >= 500) log("error:", e && e.stack || e);
-		send(res, status, { error: String(e && e.message || e) });
+		// Error text may originate from the remote service: keep it short and never let it carry control characters.
+		const text = String(e && e.message || e).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, MAX_ERROR_TEXT);
+		send(res, status, { error: text });
 	}
 });
 

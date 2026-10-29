@@ -2,7 +2,7 @@ node_modules/
 build/
 .zotero-dev/
 bridge/node_modules/
-bridge/package-lock.json
 *.log
 .env
 test/papers/*.pdf
+.env.*

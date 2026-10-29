@@ -61,9 +61,12 @@ export class TopKAddon {
 		await this.indexer.start();
 		this.initialized = true;
 
-		const selftest = getPref<string>("selftest", "");
-		if (selftest) {
-			runSelfTest(this, selftest).catch((e) => logError("selftest", e));
+		if (__DEV__) {
+			// Development builds only: the self-test imports fixtures from a pref-supplied path and quits Zotero.
+			const selftest = getPref<string>("selftest", "");
+			if (selftest) {
+				runSelfTest(this, selftest).catch((e) => logError("selftest", e));
+			}
 		}
 	}
 

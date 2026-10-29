@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
+    "pdfjs-dist": "^5.7.284",
     "typescript": "^5.9.0",
     "zotero-types": "^4.1.3"
   }

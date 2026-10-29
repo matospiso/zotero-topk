@@ -8,6 +8,10 @@ pref("extensions.zotero-topk.nodePath", "");
 pref("extensions.zotero-topk.autoIndex", true);
 pref("extensions.zotero-topk.indexSnapshots", true);
 pref("extensions.zotero-topk.maxPages", 500);
+// Attachments larger than this are skipped (the whole file is read into memory for rendering)
+pref("extensions.zotero-topk.maxFileMB", 200);
+// Give up on a document that takes longer than this to render and upload
+pref("extensions.zotero-topk.docTimeoutMinutes", 30);
 pref("extensions.zotero-topk.maxEdge", 1536);
 pref("extensions.zotero-topk.jpegQuality", 85);
 pref("extensions.zotero-topk.resultLimit", 60);

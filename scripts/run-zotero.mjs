@@ -22,12 +22,20 @@ const devDir = resolve(opt("--dev-dir", join(root, ".zotero-dev")));
 const profile = resolve(opt("--profile", join(devDir, "profile")));
 const data = resolve(opt("--data", join(devDir, "data")));
 const fresh = flag("--fresh");
+// user.js below disables add-on signing and enables the remote debugger: never write that into a real profile.
+for (const [name, dir] of [["--profile", profile], ["--data", data]]) {
+	if (!dir.startsWith(devDir + "/") && !flag("--allow-external-dirs")) {
+		console.error(`${name} ${dir} is outside the dev directory ${devDir}; pass --allow-external-dirs if you really mean it`);
+		process.exit(2);
+	}
+}
 if (fresh) {
 	rmSync(profile, { recursive: true, force: true });
 	rmSync(data, { recursive: true, force: true });
 }
-mkdirSync(join(profile, "extensions"), { recursive: true });
-mkdirSync(data, { recursive: true });
+mkdirSync(join(profile, "extensions"), { recursive: true, mode: 0o700 });
+mkdirSync(data, { recursive: true, mode: 0o700 });
+try { (await import("node:fs")).chmodSync(profile, 0o700); } catch (e) {}
 
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const extDir = join(profile, "extensions");
@@ -67,15 +75,18 @@ const prefs = {
 };
 if (flag("--fake")) prefs["extensions.zotero-topk.bridgeFake"] = true;
 if (opt("--selftest")) prefs["extensions.zotero-topk.selftest"] = resolve(opt("--selftest"));
-if (opt("--apikey")) prefs["extensions.zotero-topk.apiKey"] = opt("--apikey");
+const apiKey = process.env.TOPK_API_KEY || opt("--apikey");
+if (apiKey) prefs["extensions.zotero-topk.apiKey"] = apiKey;
 if (opt("--collection")) prefs["extensions.zotero-topk.collection"] = opt("--collection");
 if (opt("--region")) prefs["extensions.zotero-topk.region"] = opt("--region");
 if (opt("--host")) prefs["extensions.zotero-topk.host"] = opt("--host");
 if (opt("--node")) prefs["extensions.zotero-topk.nodePath"] = opt("--node");
 writeFileSync(join(profile, "user.js"),
-	Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`).join("\n") + "\n");
+	Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`).join("\n") + "\n",
+	{ mode: 0o600 });
 
 const env = { ...process.env };
+delete env.TOPK_API_KEY; // Zotero reads it from user.js; keep it out of the Zotero process environment
 if (flag("--headless")) env.MOZ_HEADLESS = "1";
 const zArgs = ["-profile", profile, "-no-remote", "-purgecaches"];
 if (flag("--debug") || flag("--headless")) zArgs.push("-ZoteroDebugText");

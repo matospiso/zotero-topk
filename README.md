@@ -38,10 +38,16 @@ Zotero (Gecko)                                   Node.js helper (bridge/server.j
 
 TopK's JavaScript SDK is a native Node module, which Zotero's Gecko runtime
 cannot load. The plugin therefore starts a tiny helper process with Node.js
-(auto‑detected, or set in settings), installs `topk-js` into
+(auto‑detected, or set in settings), installs the pinned `topk-js` version
+from the shipped lockfile (`npm ci --ignore-scripts`) into
 `<Zotero data dir>/topk-bridge/` on first run, and talks to it over
-`127.0.0.1` with a per‑session bearer token. All TopK reads and writes go
-through the SDK in that process.
+`127.0.0.1` with a per‑session random bearer token. All TopK reads and writes
+go through the SDK in that process.
+
+Page rendering happens in a content‑privileged `<browser>` loaded from
+`resource://zotero-topk/` with the plugin's own bundled copy of pdf.js, so a
+malformed PDF never meets chrome‑privileged code; HTML snapshots are printed
+with scripts disabled and all non‑file resources blocked.
 
 One TopK document per page:
 
@@ -84,9 +90,13 @@ export ZOTERO_BIN=/path/to/zotero
 npm start                # dev build + launch Zotero with a throwaway profile (.zotero-dev/)
 node scripts/run-zotero.mjs --headless --fake   # in-memory fake backend, no API key needed
 npm run e2e              # headless end-to-end test with the fake backend
-TOPK_API_KEY=… node scripts/e2e.mjs --real --collection zotero-e2e            # against TopK
-TOPK_API_KEY=… node scripts/e2e.mjs --real --region strawberry --host topk.dev  # against a dev deployment
+node scripts/e2e.mjs --real --collection zotero-e2e              # against TopK (key from .env or TOPK_API_KEY)
+node scripts/e2e.mjs --real --region strawberry --host topk.dev    # against a dev deployment
+node scripts/release.mjs                                           # release xpi + update.json with sha256
 ```
+
+Keep the API key in `.env` (git‑ignored, `chmod 600`) or in the environment;
+the scripts never put it on a command line.
 
 `scripts/e2e.mjs` imports a PDF and an HTML snapshot, waits for indexing,
 searches through the real quick‑search code path, checks the item pane data,
@@ -127,5 +137,31 @@ test/       fixtures and probe queries
 | `autoIndex` | `true` | index new/changed attachments automatically |
 | `indexSnapshots` | `true` | include HTML snapshots (printed to A4 pages) |
 | `maxPages` | `500` | pages per document |
+| `maxFileMB` | `200` | attachments larger than this are skipped |
+| `docTimeoutMinutes` | `30` | give up on a document that takes longer than this |
 | `maxEdge` / `jpegQuality` | `1536` / `85` | page image size and quality (images are re‑encoded to stay under TopK's 512 KB image limit) |
 | `resultLimit` | `60` | page hits per search |
+
+## Releasing
+
+`node scripts/release.mjs` builds the xpi and writes `update.json` with the
+asset URL of the matching GitHub release and the xpi's `sha256` as
+`update_hash`. Commit `update.json`, tag `v<version>`, create the release and
+upload the xpi; Zotero verifies the hash before installing an update. Keep
+`main` branch‑protected: whatever `update.json` says on `main` is what every
+install will fetch.
+
+## Security notes
+
+- The helper listens on `127.0.0.1` only; every request needs the per‑session
+  token (constant‑time compare) and a loopback `Host` header. Deletes and
+  manifests are always scoped to one library.
+- The API key is stored as a Zotero preference (same protection as Zotero's
+  own credentials) and is only ever sent to the helper over loopback and by
+  the SDK to `https://<region>.api.<host>`; it never appears in logs.
+- Errors coming back from TopK are shown as plain text, never interpreted as
+  markup.
+- Uninstalling the plugin removes the index state, the helper directory and
+  the plugin's preferences (including the API key).
+- Documents that fail to render are retried at most three times per file
+  version; indexing has per‑document size and time limits.

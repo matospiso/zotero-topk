@@ -191,7 +191,14 @@ export class SearchIntegration {
 		catch (e) {
 			if (seq !== this.seq) return;
 			logError("search", e);
-			try { pane.setItemsPaneMessage(`TopK search failed: ${errorMessage(e)}`); } catch (e2) {}
+			// setItemsPaneMessage() HTML-parses string arguments in the privileged main window, and the error
+			// text can originate from the TopK service: pass an element whose text node cannot be re-parsed.
+			try {
+				const el = win.document.createElementNS("http://www.w3.org/1999/xhtml", "p");
+				el.textContent = `TopK search failed: ${errorMessage(e)}`.slice(0, 500);
+				pane.setItemsPaneMessage(el);
+			}
+			catch (e2) {}
 		}
 		finally {
 			if (seq === this.seq) this.spinner(win, false);
