@@ -1,0 +1,23 @@
+{
+  "name": "zotero-topk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Semantic (visual) search over PDF and web-snapshot pages in Zotero, powered by TopK's semantic index",
+  "config": {
+    "addonID": "zotero-topk@topk.io",
+    "addonRef": "zotero-topk"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --dev",
+    "typecheck": "tsc --noEmit",
+    "start": "node scripts/build.mjs --dev && node scripts/run-zotero.mjs",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0",
+    "zotero-types": "^4.1.3"
+  }
+}

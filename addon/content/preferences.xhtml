@@ -1,0 +1,57 @@
+<linkset>
+	<html:link rel="localization" href="zotero-topk.ftl" />
+</linkset>
+<groupbox>
+	<label><html:h2 data-l10n-id="zotero-topk-prefs-connection"></html:h2></label>
+	<html:div class="zotero-topk-grid">
+		<html:label for="zotero-topk-apikey" data-l10n-id="zotero-topk-prefs-apikey"></html:label>
+		<html:input type="password" id="zotero-topk-apikey" preference="extensions.zotero-topk.apiKey" />
+		<html:span></html:span>
+		<html:span class="zotero-topk-help" data-l10n-id="zotero-topk-prefs-apikey-help"></html:span>
+
+		<html:label for="zotero-topk-region" data-l10n-id="zotero-topk-prefs-region"></html:label>
+		<html:input type="text" id="zotero-topk-region" preference="extensions.zotero-topk.region" list="zotero-topk-regions" />
+		<html:datalist id="zotero-topk-regions">
+			<html:option value="aws-us-east-1-elastica">AWS, N. Virginia</html:option>
+			<html:option value="aws-eu-central-1-monstera">AWS, Frankfurt</html:option>
+			<html:option value="gcp-us-east4-aloe">GCP, N. Virginia</html:option>
+		</html:datalist>
+		<html:span></html:span>
+		<html:span class="zotero-topk-help" data-l10n-id="zotero-topk-prefs-region-help"></html:span>
+
+		<html:label for="zotero-topk-host" data-l10n-id="zotero-topk-prefs-host"></html:label>
+		<html:input type="text" id="zotero-topk-host" preference="extensions.zotero-topk.host" placeholder="topk.io" />
+		<html:span></html:span>
+		<html:span class="zotero-topk-help" data-l10n-id="zotero-topk-prefs-host-help"></html:span>
+
+		<html:label for="zotero-topk-collection" data-l10n-id="zotero-topk-prefs-collection"></html:label>
+		<html:input type="text" id="zotero-topk-collection" preference="extensions.zotero-topk.collection" />
+
+		<html:label for="zotero-topk-node" data-l10n-id="zotero-topk-prefs-node"></html:label>
+		<html:div class="zotero-topk-row">
+			<html:input type="text" id="zotero-topk-node" preference="extensions.zotero-topk.nodePath" placeholder="auto-detect" />
+			<button id="zotero-topk-node-browse" label="…" />
+		</html:div>
+		<html:span></html:span>
+		<html:span class="zotero-topk-help" data-l10n-id="zotero-topk-prefs-node-help"></html:span>
+	</html:div>
+	<hbox align="center" class="zotero-topk-actions">
+		<button id="zotero-topk-test" data-l10n-id="zotero-topk-prefs-test" />
+		<html:span id="zotero-topk-status" class="zotero-topk-status"></html:span>
+	</hbox>
+</groupbox>
+<groupbox>
+	<label><html:h2 data-l10n-id="zotero-topk-prefs-indexing"></html:h2></label>
+	<checkbox id="zotero-topk-autoindex" preference="extensions.zotero-topk.autoIndex" data-l10n-id="zotero-topk-prefs-autoindex" native="true" />
+	<checkbox id="zotero-topk-snapshots" preference="extensions.zotero-topk.indexSnapshots" data-l10n-id="zotero-topk-prefs-snapshots" native="true" />
+	<hbox align="center">
+		<html:label for="zotero-topk-maxpages" data-l10n-id="zotero-topk-prefs-maxpages"></html:label>
+		<html:input type="number" id="zotero-topk-maxpages" min="1" max="5000" step="1" />
+	</hbox>
+	<hbox align="center" class="zotero-topk-actions">
+		<button id="zotero-topk-index-now" data-l10n-id="zotero-topk-prefs-index-now" />
+		<button id="zotero-topk-rebuild" data-l10n-id="zotero-topk-prefs-rebuild" />
+	</hbox>
+	<html:div id="zotero-topk-index-status" class="zotero-topk-status"></html:div>
+	<html:p class="zotero-topk-help" data-l10n-id="zotero-topk-prefs-usage"></html:p>
+</groupbox>

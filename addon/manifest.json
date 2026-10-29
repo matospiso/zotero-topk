@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "name": "TopK Semantic Search",
+  "version": "__version__",
+  "description": "Semantic (visual) search over the pages of your PDFs and web snapshots, powered by TopK's semantic index.",
+  "homepage_url": "https://www.topk.io/",
+  "author": "TopK",
+  "icons": {
+    "48": "content/icons/topk-48.png",
+    "96": "content/icons/topk-96.png"
+  },
+  "applications": {
+    "zotero": {
+      "id": "zotero-topk@topk.io",
+      "update_url": "https://raw.githubusercontent.com/topk-io/zotero-topk/main/update.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "10.0.*"
+    }
+  }
+}
