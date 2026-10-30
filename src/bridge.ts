@@ -43,7 +43,7 @@ export function destination() {
 		region: getPref<string>("region", ""),
 		collection: getPref<string>("collection", ""),
 		host: getPref<string>("host", "").trim() || "topk.io",
-		fake: getPref<boolean>("bridgeFake", false),
+		fake: __DEV__ && getPref<boolean>("bridgeFake", false),
 	};
 }
 
@@ -378,7 +378,7 @@ export class Bridge {
 
 	private async spawn(): Promise<void> {
 		this.token = randomToken(32);
-		const fake = getPref<boolean>("bridgeFake", false);
+		const fake = __DEV__ && getPref<boolean>("bridgeFake", false);
 		const extra: Record<string, string> = { TOPK_BRIDGE_TOKEN: this.token };
 		if (fake) extra.TOPK_BRIDGE_FAKE = "1";
 		const proc = await Subprocess.call({

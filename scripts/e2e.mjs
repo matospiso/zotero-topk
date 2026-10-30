@@ -2,7 +2,7 @@
 // backend (or the real one with --real) and checks the self-test report.
 //
 //   ZOTERO_BIN=/path/to/zotero node scripts/e2e.mjs [--real [--collection NAME] [--region R] [--host topk.dev]] [--keep] [--no-papers]
-//   The API key comes from the TOPK_API_KEY environment variable or .env (--apikey KEY also works but shows up in `ps`).
+//   The API key comes from the TOPK_API_KEY environment variable or .env (never a command-line argument).
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, cpSync, readFileSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -17,6 +17,10 @@ if (existsSync(join(root, ".env"))) {
 	}
 }
 const args = process.argv.slice(2);
+if (args.some((arg) => arg === "--apikey" || arg.startsWith("--apikey="))) {
+	console.error("--apikey is no longer supported; use TOPK_API_KEY in the environment instead.");
+	process.exit(2);
+}
 const flag = (n) => args.includes(n);
 const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
 
@@ -41,9 +45,9 @@ const runArgs = [join(root, "scripts", "run-zotero.mjs"), "--headless", "--fresh
 const childEnv = { ...process.env };
 delete childEnv.TOPK_API_KEY;
 if (flag("--real")) {
-	const apiKey = opt("--apikey") || process.env.TOPK_API_KEY;
+	const apiKey = process.env.TOPK_API_KEY;
 	if (!apiKey) {
-		console.error("--real needs --apikey KEY or TOPK_API_KEY in the environment");
+		console.error("--real needs TOPK_API_KEY in the environment or .env");
 		process.exit(2);
 	}
 	// The key travels to the child through its environment, never through argv (visible in the process list).

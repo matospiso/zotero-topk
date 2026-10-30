@@ -20,6 +20,7 @@ const PORT = Number(process.env.TOPK_BRIDGE_PORT || 0);
 const MAX_BODY = 64 * 1024 * 1024;
 const MAX_MANIFEST_ROWS = 50000;
 const MAX_ERROR_TEXT = 500;
+const MAX_IMAGE_RESPONSE_BYTES = 8 * 1024 * 1024;
 const SEARCH_FIELDS = ["library_id", "library_key", "attachment_key", "item_key", "page", "page_count", "title"];
 // Region / host are interpolated into https://<region>.api.<host> by the SDK: allow hostname labels only.
 const HOST_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/;
@@ -48,6 +49,19 @@ function asLibraryKey(value) {
 		throw new HttpError(400, "libraryKey must be a qualified Zotero library identity");
 	}
 	return value;
+}
+
+/** Return a bounded thumbnail batch; callers can request omitted IDs separately. */
+function imageResponse(images) {
+	const result = Object.create(null);
+	let bytes = Buffer.byteLength('{"images":{}}');
+	for (const [id, image] of Object.entries(images)) {
+		const size = Buffer.byteLength(JSON.stringify(id)) + Buffer.byteLength(JSON.stringify(image)) + 2;
+		if (bytes + size > MAX_IMAGE_RESPONSE_BYTES) continue;
+		result[id] = image;
+		bytes += size;
+	}
+	return { images: result };
 }
 
 function log(...args) {
@@ -229,7 +243,7 @@ class TopKBackend {
 				images[id] = { format: img.format, b64: Buffer.from(img.data).toString("base64") };
 			}
 		}
-		return { images };
+		return imageResponse(images);
 	}
 
 	async deleteAttachments({ libraryKey, attachmentKeys }) {
@@ -374,11 +388,12 @@ class FakeBackend {
 
 	async images({ ids }) {
 		const images = {};
-		for (const id of ids || []) {
+		if (!Array.isArray(ids)) return { images: {} };
+		for (const id of ids.slice(0, 50)) {
 			const d = this.docs.get(id);
 			if (d) images[id] = { format: "jpeg", b64: d.page_image_b64 };
 		}
-		return { images };
+		return imageResponse(images);
 	}
 
 	async deleteAttachments({ libraryKey, attachmentKeys }) {

@@ -118,7 +118,8 @@ node scripts/release.mjs                                           # release xpi
 ```
 
 Keep the API key in `.env` (git‑ignored, `chmod 600`) or in the environment;
-the scripts never put it on a command line.
+the scripts reject `--apikey` so keys are never accepted on a command line.
+The fake backend and self-test entry point are available only in development builds.
 
 `scripts/e2e.mjs` imports a PDF and an HTML snapshot, waits for indexing,
 searches through the real quick‑search code path, checks the item pane data,
@@ -183,7 +184,7 @@ install will fetch.
   own credentials) and is only ever sent to the helper over loopback and by
   the SDK to `https://<region>.api.<host>`; it never appears in logs.
 - Errors coming back from TopK are shown as plain text, never interpreted as
-  markup.
+  markup. Thumbnail requests return at most 50 images and 8 MiB of JSON.
 - Uninstalling the plugin removes the index state, the helper directory and
   the plugin's preferences (including the API key).
 - Documents that fail to render are retried at most three times per file

@@ -3,13 +3,17 @@
 //   node scripts/run-zotero.mjs [--headless] [--fake] [--selftest out.json] [--data DIR] [--profile DIR]
 //
 // Set ZOTERO_BIN to your Zotero executable (Linux: .../zotero, macOS: Zotero.app/Contents/MacOS/zotero).
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, chmodSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
+if (args.some((arg) => arg === "--apikey" || arg.startsWith("--apikey="))) {
+	console.error("--apikey is no longer supported; use TOPK_API_KEY in the environment instead.");
+	process.exit(2);
+}
 const flag = (name) => args.includes(name);
 const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
 
@@ -35,7 +39,7 @@ if (fresh) {
 }
 mkdirSync(join(profile, "extensions"), { recursive: true, mode: 0o700 });
 mkdirSync(data, { recursive: true, mode: 0o700 });
-try { (await import("node:fs")).chmodSync(profile, 0o700); } catch (e) {}
+chmodSync(profile, 0o700);
 
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const extDir = join(profile, "extensions");
@@ -75,13 +79,17 @@ const prefs = {
 };
 if (flag("--fake")) prefs["extensions.zotero-topk.bridgeFake"] = true;
 if (opt("--selftest")) prefs["extensions.zotero-topk.selftest"] = resolve(opt("--selftest"));
-const apiKey = process.env.TOPK_API_KEY || opt("--apikey");
+const apiKey = process.env.TOPK_API_KEY;
 if (apiKey) prefs["extensions.zotero-topk.apiKey"] = apiKey;
 if (opt("--collection")) prefs["extensions.zotero-topk.collection"] = opt("--collection");
 if (opt("--region")) prefs["extensions.zotero-topk.region"] = opt("--region");
 if (opt("--host")) prefs["extensions.zotero-topk.host"] = opt("--host");
 if (opt("--node")) prefs["extensions.zotero-topk.nodePath"] = opt("--node");
-writeFileSync(join(profile, "user.js"),
+const userPrefsPath = join(profile, "user.js");
+// writeFileSync's mode only applies to new files. Tighten an existing profile
+// before writing credentials, and stop if its permissions cannot be changed.
+if (existsSync(userPrefsPath)) chmodSync(userPrefsPath, 0o600);
+writeFileSync(userPrefsPath,
 	Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`).join("\n") + "\n",
 	{ mode: 0o600 });
 

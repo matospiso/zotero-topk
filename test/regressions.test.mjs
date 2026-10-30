@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { build } from 'esbuild';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, statSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import vm from 'node:vm';
@@ -259,4 +261,64 @@ test('group removal drains uploads and deletes using the stable group ID after t
  h.Zotero.Libraries.getAll().pop();
  const removal = h.indexer.removeLibrary(2,'group:42'); gate.resolve(); await removal; await h.idle();
  assert.equal(h.backend.docs.size,0); assert.equal(h.indexer.stats.attachments,0);
+});
+
+
+test('release builds ignore the fake-backend preference and still require credentials', async (t) => {
+ const h = await harness(t);
+ assert.equal(h.destination().fake,false);
+ h.setPref('apiKey','');
+ await assert.rejects(h.bridge.ensureReady(), /No TopK API key/);
+});
+
+test('development builds retain the fake backend', async () => {
+ const output = await build({ entryPoints:['src/bridge.ts'], bundle:true, write:false, format:'cjs', platform:'node', define:{ __DEV__:'true' } });
+ const context = vm.createContext({ module:{ exports:{} }, ChromeUtils:{ importESModule:() => ({}) }, Zotero:{ Prefs:{ get:(name) => name === 'extensions.zotero-topk.bridgeFake' ? true : undefined } } });
+ vm.runInContext(output.outputFiles[0].text,context);
+ assert.equal(context.module.exports.destination().fake,true);
+});
+
+for (const kind of ['real','fake']) test(`${kind} image responses stay below 8 MiB and still return ordinary thumbnails`, async () => {
+ const backend = kind === 'real' ? new backendContext.TopKBackend() : new backendContext.FakeBackend();
+ const bytes = Buffer.alloc(500 * 1024);
+ const ids = Array.from({ length:60 }, (_,i) => `image-${i}`);
+ if (kind === 'real') {
+  backend.client = { collection:() => ({ get:async (requested) => {
+   assert.equal(requested.length,50);
+   return Object.fromEntries(requested.map((id) => [id, { page_image:{ format:'jpeg', data:bytes } }]));
+  } }) };
+ } else {
+  await backend.upsert({ docs:ids.map((_id) => ({ _id, page_image_b64:bytes.toString('base64') })) });
+ }
+ const result = await backend.images({ ids });
+ assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8 * 1024 * 1024);
+ assert.ok(Object.keys(result.images).length > 0);
+ assert.ok(Object.keys(result.images).length < ids.length);
+ assert.equal(result.images['image-0'].b64,bytes.toString('base64'));
+});
+
+for (const script of ['e2e.mjs','run-zotero.mjs']) test(`${script} rejects command-line API keys without echoing them`, () => {
+ const secret = 'never-provisioned-test-key';
+ for (const args of [['--apikey',secret],[`--apikey=${secret}`]]) {
+  const result = spawnSync(process.execPath,[`scripts/${script}`,...args], { encoding:'utf8' });
+  assert.ifError(result.error);
+  assert.equal(result.status,2);
+  assert.match(result.stderr,/use TOPK_API_KEY/);
+  assert.ok(!(result.stdout + result.stderr).includes(secret));
+ }
+});
+
+test('dev launcher tightens existing profile and credential-file permissions', { skip:process.platform === 'win32' }, (t) => {
+ const dir = mkdtempSync(path.join(tmpdir(),'topk-profile-test-'));
+ t.after(() => rmSync(dir,{ recursive:true, force:true }));
+ const profile = path.join(dir,'profile'); const userPrefs = path.join(profile,'user.js');
+ mkdirSync(profile); chmodSync(profile,0o777); writeFileSync(userPrefs,'old preferences'); chmodSync(userPrefs,0o666);
+ const result = spawnSync(process.execPath,['scripts/run-zotero.mjs','--dev-dir',dir], {
+  env:{ ...process.env, ZOTERO_BIN:'/bin/true', TOPK_API_KEY:'never-provisioned-test-key' }, encoding:'utf8',
+ });
+ assert.ifError(result.error);
+ assert.equal(result.status,0,result.stderr);
+ assert.equal(statSync(profile).mode & 0o777,0o700);
+ assert.equal(statSync(userPrefs).mode & 0o777,0o600);
+ assert.ok(readFileSync(userPrefs,'utf8').includes('never-provisioned-test-key'));
 });
