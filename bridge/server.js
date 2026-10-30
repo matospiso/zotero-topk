@@ -20,7 +20,7 @@ const PORT = Number(process.env.TOPK_BRIDGE_PORT || 0);
 const MAX_BODY = 64 * 1024 * 1024;
 const MAX_MANIFEST_ROWS = 50000;
 const MAX_ERROR_TEXT = 500;
-const SEARCH_FIELDS = ["library_id", "attachment_key", "item_key", "page", "page_count", "title"];
+const SEARCH_FIELDS = ["library_id", "library_key", "attachment_key", "item_key", "page", "page_count", "title"];
 // Region / host are interpolated into https://<region>.api.<host> by the SDK: allow hostname labels only.
 const HOST_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/;
 const HOST_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
@@ -43,10 +43,11 @@ function hostAllowed(host) {
 	const name = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
 	return name === "127.0.0.1" || name === "localhost" || name === "::1";
 }
-function asLibraryID(value) {
-	const n = Number(value);
-	if (!Number.isInteger(n) || n < 0) throw new HttpError(400, "libraryID must be a non-negative integer");
-	return n;
+function asLibraryKey(value) {
+	if (typeof value !== "string" || !/^(group:[1-9][0-9]*|user:[1-9][0-9]*|local:[A-Za-z0-9]+)$/.test(value)) {
+		throw new HttpError(400, "libraryKey must be a qualified Zotero library identity");
+	}
+	return value;
 }
 
 function log(...args) {
@@ -117,6 +118,8 @@ class TopKBackend {
 			// One document per rendered page; the page image carries the semantic index.
 			page_image: image().required().index(semanticIndex()),
 			library_id: int().required(),
+			library_key: text(),
+			indexed_pages: int(),
 			attachment_key: text().required(),
 			item_key: text().required(),
 			page: int().required(),
@@ -170,6 +173,8 @@ class TopKBackend {
 		this.collectionName = collection;
 		this.region = region;
 		this.host = host || null;
+		this.lastLsn = null;
+		this.lastLsnAt = 0;
 		return { ok: true, created, collection, region, host: this.host };
 	}
 
@@ -199,15 +204,14 @@ class TopKBackend {
 		return { ok: true, lsn, count: payload.length };
 	}
 
-	async search({ query, limit = 50, libraryIDs }) {
+	async search({ query, limit = 50, libraryKeys }) {
 		if (!query || typeof query !== "string") throw new HttpError(400, "query is required");
 		const { select, field, fn } = this._sdk().query;
 		const selected = { score: fn.semanticSimilarity("page_image", query) };
 		for (const f of SEARCH_FIELDS) selected[f] = field(f);
 		let q = select(selected);
-		if (Array.isArray(libraryIDs) && libraryIDs.length) {
-			q = q.filter(field("library_id").in(libraryIDs.map(Number)));
-		}
+		if (!Array.isArray(libraryKeys) || !libraryKeys.length) return { hits: [] };
+		q = q.filter(field("library_key").in(libraryKeys.map(asLibraryKey)));
 		q = q.sort(field("score"), false).limit(Math.max(1, Math.min(500, Number(limit) || 50)));
 		// Read-your-writes right after indexing: wait for the last upsert to be visible.
 		const options = (this.lastLsn && Date.now() - this.lastLsnAt < 120000) ? { lsn: this.lastLsn } : undefined;
@@ -228,15 +232,15 @@ class TopKBackend {
 		return { images };
 	}
 
-	async deleteAttachments({ libraryID, attachmentKeys }) {
-		const lib = asLibraryID(libraryID);
+	async deleteAttachments({ libraryKey, attachmentKeys }) {
+		const lib = asLibraryKey(libraryKey);
 		if (!Array.isArray(attachmentKeys) || !attachmentKeys.length) return { ok: true, deleted: 0 };
 		if (!attachmentKeys.every((k) => typeof k === "string" && k.length <= 64)) throw new HttpError(400, "attachmentKeys must be strings");
 		const { field } = this._sdk().query;
 		for (let i = 0; i < attachmentKeys.length; i += 100) {
 			const chunk = attachmentKeys.slice(i, i + 100);
 			// Always scoped to one library: a collection-wide delete is never issued.
-			const expr = field("library_id").eq(lib).and(field("attachment_key").in(chunk));
+			const expr = field("library_key").eq(lib).and(field("attachment_key").in(chunk));
 			const lsn = await withRetry("delete", () => this._col().delete(expr));
 			this.lastLsn = lsn;
 			this.lastLsnAt = Date.now();
@@ -245,29 +249,45 @@ class TopKBackend {
 	}
 
 	/** Remove every page of one library (used when a group library is removed from Zotero). */
-	async deleteLibrary({ libraryID }) {
-		const lib = asLibraryID(libraryID);
+	async deleteLibrary({ libraryKey }) {
+		const lib = asLibraryKey(libraryKey);
 		const { field } = this._sdk().query;
-		const lsn = await withRetry("delete library", () => this._col().delete(field("library_id").eq(lib)));
+		const lsn = await withRetry("delete library", () => this._col().delete(field("library_key").eq(lib)));
 		this.lastLsn = lsn;
 		this.lastLsnAt = Date.now();
-		return { ok: true, libraryID: lib };
+		return { ok: true, libraryKey: lib };
+	}
+
+	async hasAttachment({ libraryKey, attachmentKey }) {
+		const lib = asLibraryKey(libraryKey);
+		if (typeof attachmentKey !== "string" || !attachmentKey) throw new HttpError(400, "attachmentKey is required");
+		const { select, field } = this._sdk().query;
+		const col = this._col();
+		const q = select("attachment_key").filter(field("library_key").eq(lib).and(field("attachment_key").eq(attachmentKey))).limit(1);
+		const docs = await withRetry("attachment status", () => col.query(q, this.readOptions()), { maxMs: 90000 });
+		return { exists: docs.length > 0 };
+	}
+
+	readOptions() {
+		return this.lastLsn && Date.now() - this.lastLsnAt < 120000 ? { lsn: this.lastLsn } : undefined;
 	}
 
 	/**
 	 * List what is already indexed (one row per attachment) so a fresh install
 	 * can reconcile with an existing collection instead of re-rendering everything.
 	 */
-	async manifest({ libraryID }) {
-		const lib = asLibraryID(libraryID);
+	async manifest({ libraryKey }) {
+		const lib = asLibraryKey(libraryKey);
 		const { select, field } = this._sdk().query;
 		const col = this._col();
 		const PAGE = 500;
 		const rows = [];
-		const base = () => field("page").eq(1).and(field("library_id").eq(lib));
+		const base = () => field("page").eq(1).and(field("indexed_pages").gt(0)).and(field("library_key").eq(lib));
 		const fields = {
 			attachment_key: field("attachment_key"),
 			library_id: field("library_id"),
+			library_key: field("library_key"),
+			indexed_pages: field("indexed_pages"),
 			file_hash: field("file_hash"),
 			page_count: field("page_count"),
 		};
@@ -276,7 +296,7 @@ class TopKBackend {
 			for (;;) {
 				let f = base();
 				if (last !== null) f = f.and(field("attachment_key").gt(last));
-				const docs = await withRetry("manifest", () => col.query(select(fields).filter(f).sort(field("attachment_key"), true).limit(PAGE)), { maxMs: 90000 });
+				const docs = await withRetry("manifest", () => col.query(select(fields).filter(f).sort(field("attachment_key"), true).limit(PAGE), this.readOptions()), { maxMs: 90000 });
 				rows.push(...docs);
 				if (docs.length < PAGE) break;
 				if (rows.length >= MAX_MANIFEST_ROWS) return { rows, complete: false };
@@ -286,7 +306,7 @@ class TopKBackend {
 		}
 		catch (e) {
 			log("manifest: keyset pagination failed, falling back to a single page:", e.message || e);
-			const docs = await withRetry("manifest fallback", () => col.query(select(fields).filter(base()).sort(field("page"), true).limit(1000)), { maxMs: 90000 });
+			const docs = await withRetry("manifest fallback", () => col.query(select(fields).filter(base()).sort(field("page"), true).limit(1000), this.readOptions()), { maxMs: 90000 });
 			return { rows: docs, complete: docs.length < 1000 };
 		}
 	}
@@ -298,6 +318,7 @@ class TopKBackend {
 class FakeBackend {
 	constructor() {
 		this.docs = new Map();
+		this.targets = new Map();
 		this.collectionName = null;
 		this.region = null;
 	}
@@ -306,11 +327,14 @@ class FakeBackend {
 		return !!this.collectionName;
 	}
 
-	async configure({ region, collection, host }) {
+	async configure({ apiKey, region, collection, host }) {
 		// Same input contract as the real backend, so tests exercise the validation.
 		if (typeof region !== "string" || !HOST_LABEL.test(region)) throw new HttpError(400, "region must be a single hostname label (e.g. aws-us-east-1-elastica)");
 		if (typeof collection !== "string" || !COLLECTION_NAME.test(collection)) throw new HttpError(400, "collection must match [A-Za-z0-9_-]{1,128}");
 		if (host != null && host !== "" && (typeof host !== "string" || !HOST_NAME.test(host))) throw new HttpError(400, "host must be a hostname (e.g. topk.io)");
+		const target = JSON.stringify([apiKey, region, collection, host]);
+		if (!this.targets.has(target)) this.targets.set(target, new Map());
+		this.docs = this.targets.get(target);
 		this.collectionName = collection;
 		this.region = region;
 		return { ok: true, created: false, collection: this.collectionName, region: this.region, fake: true };
@@ -329,13 +353,13 @@ class FakeBackend {
 		return { ok: true, lsn: String(this.docs.size), count: docs.length };
 	}
 
-	async search({ query, limit = 50, libraryIDs }) {
+	async search({ query, limit = 50, libraryKeys }) {
 		if (!query || typeof query !== "string") throw new HttpError(400, "query is required");
 		limit = Math.max(1, Math.min(500, Number(limit) || 50));
 		const terms = String(query).toLowerCase().split(/\W+/).filter(Boolean);
 		const hits = [];
 		for (const d of this.docs.values()) {
-			if (Array.isArray(libraryIDs) && libraryIDs.length && !libraryIDs.includes(d.library_id)) continue;
+			if (!Array.isArray(libraryKeys) || !libraryKeys.map(asLibraryKey).includes(d.library_key)) continue;
 			const title = String(d.title || "").toLowerCase();
 			let score = 0.01 / (1 + d.page);
 			for (const t of terms) if (title.includes(t)) score += 1;
@@ -357,12 +381,12 @@ class FakeBackend {
 		return { images };
 	}
 
-	async deleteAttachments({ libraryID, attachmentKeys }) {
-		const lib = asLibraryID(libraryID);
+	async deleteAttachments({ libraryKey, attachmentKeys }) {
+		const lib = asLibraryKey(libraryKey);
 		if (!Array.isArray(attachmentKeys)) throw new HttpError(400, "attachmentKeys must be an array");
 		let deleted = 0;
 		for (const [id, d] of this.docs) {
-			if (d.library_id === lib && attachmentKeys.includes(d.attachment_key)) {
+			if (d.library_key === lib && attachmentKeys.includes(d.attachment_key)) {
 				this.docs.delete(id);
 				deleted++;
 			}
@@ -370,18 +394,23 @@ class FakeBackend {
 		return { ok: true, deleted };
 	}
 
-	async deleteLibrary({ libraryID }) {
-		const lib = asLibraryID(libraryID);
-		for (const [id, d] of this.docs) if (d.library_id === lib) this.docs.delete(id);
-		return { ok: true, libraryID: lib };
+	async deleteLibrary({ libraryKey }) {
+		const lib = asLibraryKey(libraryKey);
+		for (const [id, d] of this.docs) if (d.library_key === lib) this.docs.delete(id);
+		return { ok: true, libraryKey: lib };
 	}
 
-	async manifest({ libraryID }) {
-		const lib = asLibraryID(libraryID);
+	async hasAttachment({ libraryKey, attachmentKey }) {
+		const lib = asLibraryKey(libraryKey);
+		return { exists: [...this.docs.values()].some((d) => d.library_key === lib && d.attachment_key === attachmentKey) };
+	}
+
+	async manifest({ libraryKey }) {
+		const lib = asLibraryKey(libraryKey);
 		const rows = [];
 		for (const d of this.docs.values()) {
-			if (d.page === 1 && d.library_id === lib) {
-				rows.push({ attachment_key: d.attachment_key, library_id: d.library_id, file_hash: d.file_hash, page_count: d.page_count });
+			if (d.page === 1 && d.indexed_pages > 0 && d.library_key === lib) {
+				rows.push({ attachment_key: d.attachment_key, library_id: d.library_id, library_key: d.library_key, indexed_pages: d.indexed_pages, file_hash: d.file_hash, page_count: d.page_count });
 			}
 		}
 		return { rows, complete: true };
@@ -391,18 +420,30 @@ class FakeBackend {
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
+// A client HTTP timeout does not cancel a TopK write. Keep mutations and
+// reconfiguration ordered here too, so a late upload cannot follow its deletion.
+let mutations = Promise.resolve();
+function serializeMutation(fn) {
+	return (...args) => {
+		const result = mutations.then(() => fn(...args));
+		mutations = result.catch(() => {});
+		return result;
+	};
+}
+
 const backend = FAKE ? new FakeBackend() : new TopKBackend();
 
 const ROUTES = {
 	"GET /health": async () => ({ ok: true, version: BRIDGE_VERSION, fake: FAKE, configured: backend.configured }),
 	"GET /status": () => backend.status(),
-	"POST /configure": (body) => backend.configure(body),
-	"POST /upsert": (body) => backend.upsert(body),
+	"POST /configure": serializeMutation((body) => backend.configure(body)),
+	"POST /upsert": serializeMutation((body) => backend.upsert(body)),
 	"POST /search": (body) => backend.search(body),
 	"POST /images": (body) => backend.images(body),
-	"POST /delete": (body) => backend.deleteAttachments(body),
-	"POST /delete-library": (body) => backend.deleteLibrary(body),
+	"POST /delete": serializeMutation((body) => backend.deleteAttachments(body)),
+	"POST /delete-library": serializeMutation((body) => backend.deleteLibrary(body)),
 	"POST /manifest": (body) => backend.manifest(body),
+	"POST /attachment-status": (body) => backend.hasAttachment(body),
 	"POST /shutdown": async () => {
 		setTimeout(() => process.exit(0), 50);
 		return { ok: true };

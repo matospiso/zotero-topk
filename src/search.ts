@@ -52,7 +52,8 @@ export class SearchIntegration {
 			dataProvider: (item: any) => this.scoreText(item),
 		});
 		this.prefObserver = Zotero.Prefs.registerObserver("search.quicksearch-mode", (value: string) => {
-			if (value !== SEARCH_MODE && this.active) {
+			if (value !== SEARCH_MODE) {
+				this.seq++;
 				for (const win of Zotero.getMainWindows()) void this.clear(win);
 			}
 		});
@@ -117,7 +118,7 @@ export class SearchIntegration {
 		const self = this;
 		pane.search = async function (runAdvanced: boolean) {
 			if (Zotero.Prefs.get("search.quicksearch-mode") !== SEARCH_MODE) {
-				if (self.active) await self.clear(win);
+				await self.clear(win);
 				return original.apply(this, arguments as any);
 			}
 			return self.runSearch(win, !!runAdvanced);
@@ -139,7 +140,7 @@ export class SearchIntegration {
 			}
 		}
 		catch (e) {}
-		if (this.active) void this.clear(win);
+		void this.clear(win);
 	}
 
 	// ----------------------------------------------------------------------
@@ -183,7 +184,8 @@ export class SearchIntegration {
 			if (seq !== this.seq) return; // superseded by newer input
 			this.lastQuery = text;
 			this.applyHits(hits);
-			await this.applyFilter(win, libraryIDs);
+			await this.applyFilter(win, libraryIDs, seq);
+			if (seq !== this.seq) return;
 			this.active = true;
 			pane.clearItemsPaneMessage?.();
 			log(`search “${text}”: ${hits.length} page hit(s), ${this.results.size} item(s)`);
@@ -236,7 +238,7 @@ export class SearchIntegration {
 		this.onResults?.();
 	}
 
-	private async applyFilter(win: any, libraryIDs: number[]) {
+	private async applyFilter(win: any, libraryIDs: number[], seq: number) {
 		const itemsView = win.ZoteroPane.itemsView;
 		const search = new Zotero.Search();
 		search.name = "TopK results";
@@ -251,7 +253,10 @@ export class SearchIntegration {
 		}
 		if (!n) search.addCondition("key", "is", "TOPK-NO-MATCH");
 		await itemsView.setFilter("search", "");
+		if (seq !== this.seq) return;
+		this.active = true;
 		await itemsView.setFilter("advanced-search", search);
+		if (seq !== this.seq) return;
 		this.sortByScore(itemsView);
 		try { itemsView.tree?.invalidate(); } catch (e) {}
 	}
@@ -272,13 +277,14 @@ export class SearchIntegration {
 
 	async clear(win: any) {
 		this.seq++;
+		const hadFilter = this.active;
 		this.active = false;
 		this.results.clear();
 		this.byAttachment.clear();
 		this.onResults?.();
 		this.spinner(win, false);
 		try {
-			await win.ZoteroPane.itemsView?.setFilter("advanced-search", null);
+			if (hadFilter) await win.ZoteroPane.itemsView?.setFilter("advanced-search", null);
 		}
 		catch (e) {
 			logError("clear", e);

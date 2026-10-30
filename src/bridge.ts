@@ -1,9 +1,11 @@
 import { getPref, delay } from "./prefs";
+import { libraryKey, localLibraryID } from "./library";
 import { log, logError, errorMessage, debug } from "./log";
 
 export interface SearchHit {
 	_id: string;
 	library_id: number;
+	library_key: string;
 	attachment_key: string;
 	item_key: string;
 	page: number;
@@ -13,8 +15,10 @@ export interface SearchHit {
 }
 
 export interface PageDoc {
+	indexed_pages?: number;
 	_id: string;
 	library_id: number;
+	library_key: string;
 	attachment_key: string;
 	item_key: string;
 	page: number;
@@ -25,10 +29,27 @@ export interface PageDoc {
 }
 
 export interface ManifestRow {
+	indexed_pages: number;
 	attachment_key: string;
 	library_id: number;
+	library_key: string;
 	file_hash: string;
 	page_count: number;
+}
+
+export function destination() {
+	return {
+		apiKey: getPref<string>("apiKey", ""),
+		region: getPref<string>("region", ""),
+		collection: getPref<string>("collection", ""),
+		host: getPref<string>("host", "").trim() || "topk.io",
+		fake: getPref<boolean>("bridgeFake", false),
+	};
+}
+
+/** Credential fingerprint only: never persist the API key in index state. */
+export function destinationKey() {
+	return Zotero.Utilities.Internal.md5(JSON.stringify(destination()));
 }
 
 export class BridgeError extends Error {
@@ -79,6 +100,7 @@ export class Bridge {
 	private startPromise: Promise<void> | null = null;
 	private configured = false;
 	private configKey = "";
+	private operations: Promise<unknown> = Promise.resolve();
 	private nodePath = "";
 	private bridgeDir = "";
 	public lastError = "";
@@ -108,12 +130,12 @@ export class Bridge {
 
 	/** Make sure the helper runs and is configured with the current preferences. */
 	async ensureReady(): Promise<void> {
+		await this.operation();
+	}
+
+	private async configure(config: ReturnType<typeof destination>): Promise<void> {
 		await this.ensureRunning();
-		const apiKey = getPref<string>("apiKey", "");
-		const region = getPref<string>("region", "");
-		const collection = getPref<string>("collection", "");
-		const host = getPref<string>("host", "").trim();
-		const fake = getPref<boolean>("bridgeFake", false);
+		const { apiKey, region, collection, host, fake } = config;
 		if (!fake && !apiKey) {
 			throw new BridgeError("No TopK API key set. Open Settings → TopK Semantic Search and paste your API key.");
 		}
@@ -455,42 +477,53 @@ export class Bridge {
 		}
 	}
 
-	async status() {
-		await this.ensureReady();
-		return this.request("GET", "/status");
+	// Configuration and its request share a lock. A preference change cannot
+	// redirect an in-flight operation (including a backend retry) to another target.
+	private operation(path?: string, body?: unknown, timeout = 120000): Promise<any> {
+		const config = destination();
+		const result = this.operations.then(async () => {
+			await this.configure(config);
+			return path ? this.request(path === "/status" ? "GET" : "POST", path, body, timeout) : undefined;
+		});
+		this.operations = result.catch(() => {});
+		return result;
 	}
 
+	async status() { return this.operation("/status"); }
+
 	async upsert(docs: PageDoc[]): Promise<{ lsn: string }> {
-		await this.ensureReady();
-		return this.request("POST", "/upsert", { docs }, 300000);
+		return this.operation("/upsert", { docs }, 300000);
 	}
 
 	async search(query: string, opts: { limit?: number; libraryIDs?: number[] } = {}): Promise<SearchHit[]> {
-		await this.ensureReady();
-		const res = await this.request("POST", "/search", { query, limit: opts.limit ?? 50, libraryIDs: opts.libraryIDs }, 60000);
-		return res.hits as SearchHit[];
+		const ids = opts.libraryIDs?.length ? opts.libraryIDs : Zotero.Libraries.getAll()
+			.filter((l: any) => l.libraryType !== "feed").map((l: any) => l.libraryID);
+		const res = await this.operation("/search", { query, limit: opts.limit ?? 50, libraryKeys: ids.map(libraryKey) }, 60000);
+		return res.hits.flatMap((hit: SearchHit) => {
+			const id = localLibraryID(hit.library_key);
+			return id === undefined ? [] : [{ ...hit, library_id: id }];
+		});
 	}
 
 	async images(ids: string[]): Promise<Record<string, { format: string; b64: string }>> {
-		await this.ensureReady();
-		const res = await this.request("POST", "/images", { ids }, 60000);
-		return res.images;
+		return (await this.operation("/images", { ids }, 60000)).images;
 	}
 
-	async deleteAttachments(libraryID: number, attachmentKeys: string[]): Promise<void> {
+	async deleteAttachments(library: number | string, attachmentKeys: string[]): Promise<void> {
 		if (!attachmentKeys.length) return;
-		await this.ensureReady();
-		await this.request("POST", "/delete", { libraryID, attachmentKeys });
+		await this.operation("/delete", { libraryKey: typeof library === "string" ? library : libraryKey(library), attachmentKeys }, 300000);
 	}
 
-	async deleteLibrary(libraryID: number): Promise<void> {
-		await this.ensureReady();
-		await this.request("POST", "/delete-library", { libraryID });
+	async deleteLibrary(library: number | string): Promise<void> {
+		await this.operation("/delete-library", { libraryKey: typeof library === "string" ? library : libraryKey(library) }, 300000);
 	}
 
 	async manifest(libraryID: number): Promise<{ rows: ManifestRow[]; complete: boolean }> {
-		await this.ensureReady();
-		return this.request("POST", "/manifest", { libraryID }, 300000);
+		return this.operation("/manifest", { libraryKey: libraryKey(libraryID) }, 300000);
+	}
+
+	async hasAttachment(libraryID: number, attachmentKey: string): Promise<boolean> {
+		return (await this.operation("/attachment-status", { libraryKey: libraryKey(libraryID), attachmentKey }, 300000)).exists;
 	}
 
 	async testConnection(): Promise<any> {
@@ -499,7 +532,7 @@ export class Bridge {
 			// Force a (re)configure so a changed key/collection is picked up.
 			this.configured = false;
 			await this.ensureReady();
-			const status = await this.request("GET", "/status");
+			const status = await this.status();
 			return { ...status, fake: this.info.fake };
 		}
 		catch (e) {

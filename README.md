@@ -53,16 +53,36 @@ One TopK document per page:
 
 | field            | type                               |
 | ---------------- | ---------------------------------- |
-| `_id`            | `"<libraryID>/<attachmentKey>/<page>"` |
+| `_id`            | `"<libraryKey>/<attachmentKey>/<page>"` |
 | `page_image`     | `image().required().index(semanticIndex())` |
-| `library_id`     | `int()`                            |
+| `library_key`    | `text()` (`group:<groupID>`, `user:<userID>`, or `local:<localUserKey>`) |
+| `library_id`     | `int()` (originating local ID, retained for compatibility) |
 | `attachment_key` | `text()`                           |
 | `item_key`       | `text()` (parent item, or the attachment itself) |
 | `page`, `page_count` | `int()`                        |
+| `indexed_pages` | `int()` (completion marker on page 1, including the configured page limit) |
 | `title`          | `text()`                           |
 | `file_hash`      | `text()` (sha256 of the file, used to skip unchanged files) |
 
-Search: `select({score: fn.semanticSimilarity("page_image", query), …}).filter(field("library_id").in(ids)).sort(field("score"), false).limit(n)`.
+Search: `select({score: fn.semanticSimilarity("page_image", query), …}).filter(field("library_key").in(keys)).sort(field("score"), false).limit(n)`.
+
+Page 1 is uploaded last, with `indexed_pages`, only after every other rendered
+page has uploaded successfully. Startup reconciliation accepts only these
+completion records. Local state and pending removals are stored separately for
+each region, host, collection, and API-key fingerprint; API keys are not written
+into the state file. Rotating a key triggers reconciliation with the destination.
+
+Remote group identities use Zotero group IDs, and synced personal libraries use
+Zotero user IDs. Unsynced personal libraries use Zotero's local user key. Search
+results are translated back to the current installation's local library IDs.
+
+**Upgrading an existing index:** older numeric-library document IDs and local
+state cannot safely establish library ownership or upload completion. They are
+ignored and current attachments are indexed again under stable IDs. Legacy
+remote pages are retained because their ownership is ambiguous across installs;
+use a new collection for the upgraded index and retire the old collection when
+it is no longer needed. Signing an unsynced personal library into Zotero likewise
+moves it from its local identity to its synced user identity.
 
 ## Requirements
 
@@ -85,6 +105,8 @@ Search: `select({score: fn.semanticSimilarity("page_image", query), …}).filter
 
 ```sh
 npm install
+npm test                 # deterministic failure/race regression tests
+npm run typecheck
 npm run build            # → build/addon + build/zotero-topk-<version>.xpi
 export ZOTERO_BIN=/path/to/zotero
 npm start                # dev build + launch Zotero with a throwaway profile (.zotero-dev/)
@@ -100,7 +122,8 @@ the scripts never put it on a command line.
 
 `scripts/e2e.mjs` imports a PDF and an HTML snapshot, waits for indexing,
 searches through the real quick‑search code path, checks the item pane data,
-and verifies that trashing an attachment removes it from the index. It reads
+and verifies within a bounded timeout that trashing an attachment removes both
+its local state and all of its remote pages. It reads
 `TOPK_API_KEY` / `TOPK_REGION` / `TOPK_HOST` from a local `.env` file (git‑ignored)
 if present. Any PDFs dropped into `test/papers/` (git‑ignored) are imported too and
 the probe queries in `test/queries.json` are run against them, saving the top

@@ -2,6 +2,29 @@ import type { TopKAddon } from "./addon";
 import { delay } from "./prefs";
 import { log, errorMessage } from "./log";
 
+/** Assert both sides of deletion, with a deadline even if the bridge never responds. */
+export async function verifyRemoval(addon: Pick<TopKAddon, "bridge" | "indexer">, item: any, timeoutMs = 30000) {
+	let finished = false;
+	let stillIndexed = true;
+	let remoteExists = true;
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(
+			`Attachment removal timed out (local state: ${stillIndexed}, remote pages: ${remoteExists})`)), timeoutMs);
+	});
+	const check = async () => {
+		while (!finished) {
+			stillIndexed = !!addon.indexer.getState(item);
+			remoteExists = await addon.bridge.hasAttachment(item.libraryID, item.key);
+			if (!stillIndexed && !remoteExists) return { stillIndexed, remoteExists };
+			if (!finished) await delay(200);
+		}
+		throw new Error("Attachment removal check expired");
+	};
+	try { return await Promise.race([check(), timeout]); }
+	finally { finished = true; clearTimeout(timer!); }
+}
+
 /**
  * Development-only end-to-end check, driven by scripts/e2e.mjs:
  * imports fixture attachments, waits for indexing, runs a search through the
@@ -57,11 +80,11 @@ export async function runSelfTest(addon: TopKAddon, outPath: string) {
 		await addon.indexer.whenIdle(900000);
 		const pdfState = addon.indexer.getState(pdfItem);
 		step("papers indexed", { papers: paperItems.map((it) => ({ title: it.getDisplayTitle(), state: addon.indexer.getState(it) })) });
-		for (const it of paperItems) if (!addon.indexer.getState(it)) report.errors.push(`paper not indexed: ${it.getDisplayTitle()} (${addon.indexer.lastError})`);
+		for (const it of paperItems) if (addon.indexer.getState(it)?.status !== "ok") report.errors.push(`paper not indexed: ${it.getDisplayTitle()} (${addon.indexer.lastError})`);
 		const htmlState = snapshotItem ? addon.indexer.getState(snapshotItem) : null;
 		step("indexed", { pdf: pdfState, html: htmlState, status: addon.getStatusText() });
-		if (!pdfState) report.errors.push("PDF was not indexed: " + addon.indexer.lastError);
-		if (snapshotItem && !htmlState) report.errors.push("Snapshot was not indexed: " + addon.indexer.lastError);
+		if (pdfState?.status !== "ok") report.errors.push("PDF was not indexed: " + addon.indexer.lastError);
+		if (snapshotItem && htmlState?.status !== "ok") report.errors.push("Snapshot was not indexed: " + addon.indexer.lastError);
 
 		// 3. Direct bridge search + image fetch.
 		const hits = await addon.bridge.search("elephants", { limit: 10, libraryIDs: [libraryID] });
@@ -144,8 +167,7 @@ export async function runSelfTest(addon: TopKAddon, outPath: string) {
 		if (pdfState) {
 			pdfItem.deleted = true;
 			await pdfItem.saveTx();
-			await delay(2500);
-			step("trashed", { stillIndexed: !!addon.indexer.getState(pdfItem) });
+			step("trashed", await verifyRemoval(addon, pdfItem));
 		}
 		report.ok = report.errors.length === 0;
 	}

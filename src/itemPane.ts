@@ -12,7 +12,7 @@ const PANE_ID = "zotero-topk-pages";
  */
 export class ItemPaneSection {
 	private registered: string | false = false;
-	private refreshers = new Set<() => void>();
+	private refreshers = new Map<any, () => void>();
 
 	constructor(private bridge: Bridge, private indexer: Indexer, private search: SearchIntegration) {}
 
@@ -22,8 +22,8 @@ export class ItemPaneSection {
 			pluginID: PLUGIN_ID,
 			header: { l10nID: "zotero-topk-section-head", icon: "chrome://zotero-topk/content/icons/topk-16.svg" },
 			sidenav: { l10nID: "zotero-topk-section-sidenav", icon: "chrome://zotero-topk/content/icons/topk-20.svg" },
-			onInit: ({ refresh }: any) => { if (refresh) this.refreshers.add(refresh); },
-			onDestroy: ({ refresh }: any) => { if (refresh) this.refreshers.delete(refresh); },
+			onInit: ({ body, refresh }: any) => { if (body && refresh) this.refreshers.set(body, refresh); },
+			onDestroy: ({ body }: any) => { this.refreshers.delete(body); },
 			onItemChange: ({ item, setEnabled }: any) => setEnabled(this.relevantAttachments(item).length > 0),
 			onRender: ({ body, item, doc }: any) => {
 				try { this.render(body, item, doc); } catch (e) { logError("itemPane render", e); }
@@ -35,6 +35,7 @@ export class ItemPaneSection {
 	}
 
 	unregister() {
+		this.refreshers.clear();
 		if (this.registered) {
 			try { Zotero.ItemPaneManager.unregisterSection(this.registered); } catch (e) {}
 			this.registered = false;
@@ -43,7 +44,7 @@ export class ItemPaneSection {
 
 	/** Ask Zotero to re-render the section after search results change. */
 	refresh() {
-		for (const refresh of this.refreshers) {
+		for (const refresh of this.refreshers.values()) {
 			try { refresh(); } catch (e) {}
 		}
 	}
@@ -130,6 +131,9 @@ export class ItemPaneSection {
 			const current = this.indexer.current;
 			if (current && current.itemID === att.id) {
 				state.textContent = `indexing page ${current.page}…`;
+			}
+			else if (st && st.status !== "ok") {
+				state.textContent = st.status === "failed" ? "indexing failed" : "indexing incomplete";
 			}
 			else if (st) {
 				state.textContent = `${st.pages} page${st.pages === 1 ? "" : "s"} indexed`;

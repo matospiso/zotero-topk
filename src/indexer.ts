@@ -1,4 +1,5 @@
-import { Bridge, PageDoc, BridgeError } from "./bridge";
+import { Bridge, PageDoc, BridgeError, destinationKey } from "./bridge";
+import { libraryKey } from "./library";
 import { Renderer, RenderedPage } from "./renderer";
 import { getPref, delay } from "./prefs";
 import { log, logError, errorMessage, debug } from "./log";
@@ -21,6 +22,7 @@ export interface AttachmentState {
 
 interface PendingDelete {
 	libraryID: number;
+	libraryKey: string;
 	key?: string; // absent = whole library
 }
 
@@ -37,7 +39,17 @@ const MAX_FAILED_VERSIONS = 3; // give up on a file version after this many non-
 // author cannot influence scheduling through the text of a parser error.
 const TRANSIENT_ERROR = /Unavailable|temporarily unavailable|QuotaExceeded|Too many requests|timed out|timeout|deadline|transport|connection|bridge is not running|bridge exited/i;
 const SETUP_ERROR = /API key|not configured|Node\.js|npm|Invalid TopK|Invalid collection/i;
-const STATE_PREFS = ["region", "host", "collection"];
+const STATE_PREFS = ["apiKey", "region", "host", "collection", "bridgeFake"];
+
+class JobCancelled extends Error {}
+
+interface ActiveJob {
+	libraryID: number;
+	key: string;
+	target: string;
+	signal: { cancelled: boolean };
+	done: Promise<void>;
+}
 
 function isTransient(e: unknown, msg: string) {
 	return (e instanceof BridgeError && TRANSIENT_ERROR.test(msg)) || (e as any)?.transient === true;
@@ -70,11 +82,11 @@ export function classifyAttachment(item: any): AttachmentKind | null {
 }
 
 export function stateKey(libraryID: number, key: string) {
-	return `${libraryID}/${key}`;
+	return `${libraryKey(libraryID)}/${key}`;
 }
 
 export function pageDocID(libraryID: number, key: string, page: number) {
-	return `${libraryID}/${key}/${page}`;
+	return `${libraryKey(libraryID)}/${key}/${page}`;
 }
 
 /**
@@ -99,9 +111,12 @@ export class Indexer {
 	public current: { itemID: number; title: string; page: number; total: number } | null = null;
 	public lastError = "";
 	public onChange: (() => void) | null = null;
-	private cancelSignal = { cancelled: false };
 	private pendingDeletes: PendingDelete[] = [];
 	private prefObservers: any[] = [];
+	private activeJob: ActiveJob | null = null;
+	private targets = new Map<string, { state: Map<string, AttachmentState>; pendingDeletes: PendingDelete[] }>();
+	private writes: Promise<void> = Promise.resolve();
+	private deleting: Promise<void> | null = null;
 
 	constructor(private bridge: Bridge, private renderer: Renderer) {}
 
@@ -109,9 +124,11 @@ export class Indexer {
 		return PathUtils.join(Zotero.DataDirectory.dir, "topk-index-state.json");
 	}
 
-	/** Identity of the TopK target the local state describes; state from another target is discarded. */
-	private target(): string {
-		return JSON.stringify([getPref<string>("region", ""), getPref<string>("host", "").trim(), getPref<string>("collection", "")]);
+	/** Identity of the TopK target the local state describes; each destination retains its own state and pending removals. */
+	private target(): string { return destinationKey(); }
+
+	private checkJob(job: ActiveJob) {
+		if (this.stopped || job.signal.cancelled || job.target !== this.target()) throw new JobCancelled();
 	}
 
 	// ----------------------------------------------------------------------
@@ -126,12 +143,13 @@ export class Indexer {
 			["item", "group"],
 			"zotero-topk"
 		);
-		// Switching region/host/collection points at a different index: local state no longer applies.
+		// A different credential or destination must never inherit reconciliation or completed state.
 		for (const name of STATE_PREFS) {
 			this.prefObservers.push(Zotero.Prefs.registerObserver(`extensions.zotero-topk.${name}`, () => {
 				void this.resetStateIfTargetChanged();
 			}, true));
 		}
+		void this.retryPendingDeletes();
 		if (getPref<boolean>("autoIndex", true)) {
 			// Let Zotero finish starting up before scanning the library.
 			setTimeout(() => {
@@ -142,7 +160,7 @@ export class Indexer {
 
 	stop() {
 		this.stopped = true;
-		this.cancelSignal.cancelled = true;
+		if (this.activeJob) this.activeJob.signal.cancelled = true;
 		if (this.notifierID) {
 			Zotero.Notifier.unregisterObserver(this.notifierID);
 			this.notifierID = null;
@@ -167,66 +185,66 @@ export class Indexer {
 		try {
 			if (await IOUtils.exists(this.statePath)) {
 				const data = JSON.parse(await IOUtils.readUTF8(this.statePath));
-				if (data && data.target && data.target !== this.target()) {
-					log("index state belongs to a different TopK region/host/collection; starting fresh");
-					return;
+				// Older state has neither credential scope nor stable library identities.
+				if (data.version === 3) {
+					for (const [target, value] of Object.entries<any>(data.targets || {})) {
+						this.targets.set(target, { state: new Map(Object.entries(value.attachments || {})), pendingDeletes: value.pendingDeletes || [] });
+					}
 				}
-				if (data && data.attachments) {
-					for (const [k, v] of Object.entries<any>(data.attachments)) this.state.set(k, v);
-				}
-				if (Array.isArray(data?.pendingDeletes)) this.pendingDeletes = data.pendingDeletes;
-				log(`loaded index state for ${this.state.size} attachment(s), ${this.pendingDeletes.length} pending delete(s)`);
 			}
 		}
-		catch (e) {
-			logError("loadState", e);
-		}
+		catch (e) { logError("loadState", e); }
+		this.selectTarget(this.target());
+	}
+
+	private selectTarget(target: string) {
+		if (!this.targets.has(target)) this.targets.set(target, { state: new Map(), pendingDeletes: [] });
+		const saved = this.targets.get(target)!;
+		this.state = saved.state;
+		this.pendingDeletes = saved.pendingDeletes;
+		this.lastTarget = target;
+		this.reconciled.clear();
 	}
 
 	private async saveState(now = false) {
-		if (this.saveTimer) {
-			clearTimeout(this.saveTimer);
+		if (this.saveTimer) clearTimeout(this.saveTimer);
+		this.saveTimer = null;
+		const write = () => {
 			this.saveTimer = null;
-		}
-		const write = async () => {
-			try {
-				const attachments: Record<string, AttachmentState> = {};
-				for (const [k, v] of this.state) attachments[k] = v;
-				await IOUtils.writeUTF8(this.statePath,
-					JSON.stringify({ version: 2, target: this.target(), attachments, pendingDeletes: this.pendingDeletes }),
-					{ tmpPath: this.statePath + ".tmp" });
-			}
-			catch (e) {
-				logError("saveState", e);
-			}
+			const targets = Object.fromEntries([...this.targets].map(([key, value]) =>
+				[key, { attachments: Object.fromEntries(value.state), pendingDeletes: value.pendingDeletes }]));
+			const data = JSON.stringify({ version: 3, targets });
+			this.writes = this.writes.then(() => IOUtils.writeUTF8(this.statePath, data,
+				{ tmpPath: this.statePath + ".tmp" })).catch((e) => logError("saveState", e));
+			return this.writes;
 		};
 		if (now) return write();
 		this.saveTimer = setTimeout(write, 1500) as any;
 	}
 
 	getState(item: any): AttachmentState | undefined {
+		if (this.target() !== this.lastTarget) return undefined;
 		return this.state.get(stateKey(item.libraryID, item.key));
 	}
 
 	private lastTarget = "";
 
 	private async resetStateIfTargetChanged() {
-		const t = this.target();
-		if (t === this.lastTarget) return;
-		this.lastTarget = t;
-		if (!this.state.size && !this.pendingDeletes.length) return;
-		log("TopK target changed: clearing local index state");
-		this.state.clear();
-		this.pendingDeletes = [];
-		this.reconciled.clear();
+		const target = this.target();
+		if (target === this.lastTarget) return;
+		if (this.activeJob) this.activeJob.signal.cancelled = true;
+		this.queue = [];
+		this.queued.clear();
+		this.selectTarget(target);
 		await this.saveState(true);
 		this.onChange?.();
 	}
 
 	get stats() {
 		let pages = 0;
-		for (const s of this.state.values()) pages += s.pages;
-		return { attachments: this.state.size, pages, queued: this.queue.length, running: this.running };
+		let attachments = 0;
+		for (const s of this.state.values()) if (s.status === "ok") { pages += s.pages; attachments++; }
+		return { attachments, pages, queued: this.queue.length, running: this.running };
 	}
 
 	getStatusText(): string {
@@ -249,7 +267,7 @@ export class Indexer {
 			if (event === "delete") {
 				for (const id of ids) {
 					const libraryID = Number(extraData?.[id]?.libraryID);
-					if (libraryID) void this.removeLibrary(libraryID);
+					if (libraryID) void this.removeLibrary(libraryID, `group:${id}`);
 				}
 			}
 			return;
@@ -308,7 +326,8 @@ export class Indexer {
 	// ----------------------------------------------------------------------
 
 	enqueue(item: any, force: boolean) {
-		if (this.stopped || !item) return;
+		void this.resetStateIfTargetChanged();
+		if (this.stopped || !item || this.hasPendingDelete(item.libraryID, item.key)) return;
 		if (this.queued.has(item.id)) {
 			if (force) for (const j of this.queue) if (j.itemID === item.id) j.force = true;
 			return;
@@ -335,53 +354,53 @@ export class Indexer {
 	}
 
 	async removeItems(items: any[]) {
-		const byLibrary = new Map<number, string[]>();
-		const collect = (att: any) => {
-			if (!att.isAttachment()) return;
-			const list = byLibrary.get(att.libraryID) || [];
-			list.push(att.key);
-			byLibrary.set(att.libraryID, list);
-		};
-		for (const item of items) {
-			if (item.isAttachment()) collect(item);
-			else if (item.isRegularItem()) for (const att of Zotero.Items.get(item.getAttachments())) collect(att);
-		}
-		for (const [libraryID, keys] of byLibrary) {
-			try {
-				await this.bridge.deleteAttachments(libraryID, keys);
-			}
-			catch (e) {
-				for (const k of keys) this.pendingDeletes.push({ libraryID, key: k });
-				await this.saveState();
-				throw e;
-			}
-			for (const k of keys) this.state.delete(stateKey(libraryID, k));
-		}
-		await this.saveState();
-		this.onChange?.();
+		const attachments = items.flatMap((item) => item.isAttachment() ? [item]
+			: item.isRegularItem() ? Zotero.Items.get(item.getAttachments()) : []);
+		await Promise.all(attachments.map((att) => this.remove(att.libraryID, att.key)));
 	}
 
-	/** Retry deletions that could not be delivered earlier (bridge down, offline). */
+	private hasPendingDelete(libraryID: number, key?: string) {
+		return this.pendingDeletes.some((d) => d.libraryID === libraryID && (!d.key || d.key === key));
+	}
+
+	/** Tombstones remain durable until their remote deletion has succeeded. */
 	private async flushPendingDeletes() {
-		if (!this.pendingDeletes.length) return;
+		while (this.deleting) await this.deleting;
+		const target = this.lastTarget;
 		const pending = this.pendingDeletes;
-		this.pendingDeletes = [];
-		const failed: PendingDelete[] = [];
-		for (const d of pending) {
-			try {
-				if (d.key) await this.bridge.deleteAttachments(d.libraryID, [d.key]);
-				else await this.bridge.deleteLibrary(d.libraryID);
+		const work = async () => {
+			for (const d of [...pending]) {
+				const active = this.activeJob;
+				if (active && active.target === target && active.libraryID === d.libraryID && (!d.key || d.key === active.key)) {
+					active.signal.cancelled = true;
+					await active.done;
+				}
+				if (this.stopped || this.target() !== target) return;
+				try {
+					if (d.key) await this.bridge.deleteAttachments(d.libraryKey, [d.key]);
+					else await this.bridge.deleteLibrary(d.libraryKey);
+					const i = pending.indexOf(d);
+					if (i >= 0) pending.splice(i, 1);
+					await this.saveState(true);
+				}
+				catch (e) { logError("pending delete", e); }
 			}
-			catch (e) {
-				failed.push(d);
-			}
-		}
-		this.pendingDeletes.push(...failed);
-		if (failed.length !== pending.length) log(`flushed ${pending.length - failed.length} pending delete(s)${failed.length ? `, ${failed.length} still pending` : ""}`);
-		await this.saveState();
+		};
+		const promise = work();
+		this.deleting = promise;
+		try { await promise; }
+		finally { if (this.deleting === promise) this.deleting = null; }
+	}
+
+	/** Reconnect cleanup is independent of the automatic-ingest preference. */
+	async retryPendingDeletes() {
+		await this.resetStateIfTargetChanged();
+		await this.flushPendingDeletes();
 	}
 
 	async indexAllLibraries({ force }: { force: boolean }) {
+		await this.resetStateIfTargetChanged();
+		await this.flushPendingDeletes();
 		for (const library of Zotero.Libraries.getAll()) {
 			if (library.libraryType === "feed") continue;
 			await this.indexLibrary(library.libraryID, { force });
@@ -389,16 +408,21 @@ export class Indexer {
 	}
 
 	async indexLibrary(libraryID: number, { force }: { force: boolean }) {
+		await this.resetStateIfTargetChanged();
+		await this.flushPendingDeletes();
+		const target = this.lastTarget;
 		if (!force) await this.reconcile(libraryID);
 		const items = await Zotero.Items.getAll(libraryID, false, false, false);
 		let n = 0;
 		for (const item of items) {
+			if (this.target() !== target) return;
 			if (!classifyAttachment(item)) continue;
 			if (!force) {
 				const st = this.getState(item);
 				// Cheap pre-check: if we have state, the hash check happens when the job runs.
 				if (st && !(await this.needsReindex(item, st))) continue;
 			}
+			if (this.target() !== target) return;
 			this.enqueue(item, force);
 			n++;
 		}
@@ -408,20 +432,27 @@ export class Indexer {
 	/** Pull the list of already indexed attachments from TopK so a fresh install doesn't re-render everything. */
 	private async reconcile(libraryID: number) {
 		if (this.reconciled.has(libraryID)) return;
-		this.reconciled.add(libraryID);
+		const target = this.lastTarget;
 		try {
 			const { rows, complete } = await this.bridge.manifest(libraryID);
+			if (this.target() !== target) return;
+			if (complete) this.reconciled.add(libraryID);
 			let updated = 0;
 			for (const row of rows) {
-				if (Number(row.library_id) !== libraryID || typeof row.attachment_key !== "string") continue;
-				const k = stateKey(row.library_id, row.attachment_key);
+				if (this.target() !== target) return;
+				if (row.library_key !== libraryKey(libraryID) || typeof row.attachment_key !== "string"
+					|| !Number.isInteger(row.indexed_pages) || row.indexed_pages < 1) continue;
+				if (this.hasPendingDelete(libraryID, row.attachment_key)) continue;
+				const item = Zotero.Items.getByLibraryAndKey(libraryID, row.attachment_key);
+				if (item?.deleted) { await this.remove(libraryID, row.attachment_key); continue; }
+				const k = stateKey(libraryID, row.attachment_key);
 				const existing = this.state.get(k);
-				if (!existing || existing.hash !== row.file_hash) {
+				if (!existing) {
 					this.state.set(k, {
-						libraryID: row.library_id,
+						libraryID,
 						key: row.attachment_key,
 						hash: row.file_hash,
-						pages: row.page_count,
+						pages: row.indexed_pages,
 						totalPages: row.page_count,
 						kind: "pdf",
 						at: Date.now(),
@@ -441,19 +472,24 @@ export class Indexer {
 	private async run() {
 		if (this.running || this.stopped) return;
 		this.running = true;
-		this.cancelSignal = { cancelled: false };
 		try {
 			try { await this.flushPendingDeletes(); } catch (e) { logError("pending deletes", e); }
 			while (this.queue.length && !this.stopped) {
 				const job = this.queue.shift()!;
 				this.queued.delete(job.itemID);
 				const item = Zotero.Items.get(job.itemID);
-				if (!item) continue;
+				if (!item || this.hasPendingDelete(item.libraryID, item.key)) continue;
+				let finish!: () => void;
+				const active: ActiveJob = { libraryID: item.libraryID, key: item.key, target: this.target(),
+					signal: { cancelled: false }, done: new Promise<void>((resolve) => { finish = resolve; }) };
+				this.activeJob = active;
 				try {
-					await this.indexAttachment(item, job.force);
+					await this.resetStateIfTargetChanged();
+					await this.indexAttachment(item, job.force, active);
 					this.lastError = "";
 				}
 				catch (e) {
+					if (e instanceof JobCancelled || active.signal.cancelled || active.target !== this.target()) continue;
 					this.lastError = errorMessage(e);
 					logError(`indexing ${item.key}`, e);
 					const attempt = (job.attempt || 1);
@@ -463,7 +499,7 @@ export class Indexer {
 						log(`will retry ${item.key} in ${wait / 1000}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
 						this.setProgressText(`Waiting for TopK… (${item.getDisplayTitle?.() || item.key})`);
 						await delay(wait);
-						if (!this.stopped) {
+						if (!this.stopped && !active.signal.cancelled && active.target === this.target()) {
 							this.queue.push({ itemID: job.itemID, force: job.force, attempt: attempt + 1 });
 							this.queued.add(job.itemID);
 							this.progressTotal++;
@@ -479,6 +515,8 @@ export class Indexer {
 					}
 				}
 				finally {
+					this.activeJob = null;
+					finish();
 					this.progressDone++;
 					this.current = null;
 					this.onChange?.();
@@ -505,6 +543,7 @@ export class Indexer {
 	}
 
 	private async needsReindex(item: any, st: AttachmentState): Promise<boolean> {
+		if (st.status === "partial" || (st.status === "failed" && (st.attempts || 0) < MAX_FAILED_VERSIONS)) return true;
 		const path = await item.getFilePathAsync();
 		if (!path) return false;
 		return (await this.fileHash(path)) !== st.hash;
@@ -516,7 +555,8 @@ export class Indexer {
 		return { parent, title: String(title).slice(0, 500), itemKey: parent ? parent.key : item.key };
 	}
 
-	private async indexAttachment(item: any, force: boolean) {
+	private async indexAttachment(item: any, force: boolean, job: ActiveJob) {
+		this.checkJob(job);
 		const kind = classifyAttachment(item);
 		if (!kind) return;
 		const path = await item.getFilePathAsync();
@@ -525,6 +565,7 @@ export class Indexer {
 			return;
 		}
 		const hash = await this.fileHash(path);
+		this.checkJob(job);
 		const sk = stateKey(item.libraryID, item.key);
 		const existing = this.state.get(sk);
 		if (!force && existing && existing.hash === hash && existing.status !== "partial") {
@@ -547,16 +588,20 @@ export class Indexer {
 		log(`indexing ${kind} ${item.libraryID}/${item.key} “${title}”`);
 
 		await this.bridge.ensureReady();
-		if (existing && existing.status !== "failed") {
-			// Page count may have shrunk; drop stale pages first.
-			await this.bridge.deleteAttachments(item.libraryID, [item.key]);
-		}
+		this.checkJob(job);
+		// Invalidate the completed version before deleting any pages, even if rendering fails.
+		this.state.set(sk, { libraryID: item.libraryID, key: item.key, hash, pages: 0, totalPages: 0, kind, at: Date.now(), status: "partial" });
+		await this.saveState(true);
+		this.checkJob(job);
 		try {
-			await this.uploadAttachment(item, kind, path, hash, existing, title, itemKey);
+			// Always clear an interrupted remote version, including one unknown locally.
+			await this.bridge.deleteAttachments(item.libraryID, [item.key]);
+			this.checkJob(job);
+			await this.uploadAttachment(item, kind, path, hash, title, itemKey, job);
 		}
 		catch (e) {
 			const msg = errorMessage(e);
-			if (!isTransient(e, msg) && !this.cancelSignal.cancelled) {
+			if (!(e instanceof JobCancelled) && !isTransient(e, msg) && !job.signal.cancelled && job.target === this.target()) {
 				// Remember the failure so a document that always fails is not re-rendered on every startup.
 				const attempts = (existing?.status === "failed" && existing.hash === hash ? existing.attempts || 0 : 0) + 1;
 				this.state.set(sk, { libraryID: item.libraryID, key: item.key, hash, pages: 0, totalPages: 0, kind, at: Date.now(), status: "failed", attempts, error: msg.slice(0, 300) });
@@ -566,11 +611,14 @@ export class Indexer {
 		}
 	}
 
-	private async uploadAttachment(item: any, kind: AttachmentKind, path: string, hash: string, existing: AttachmentState | undefined, title: string, itemKey: string) {
+	private async uploadAttachment(item: any, kind: AttachmentKind, path: string, hash: string, title: string, itemKey: string, job: ActiveJob) {
 		const sk = stateKey(item.libraryID, item.key);
 
-		const signal = { cancelled: false };
-		const parentSignal = this.cancelSignal;
+		let cancelled = false;
+		const signal = {
+			get cancelled() { return cancelled || job.signal.cancelled; },
+			set cancelled(value: boolean) { cancelled = value; },
+		};
 		const batchPages = Math.max(1, getPref<number>("uploadBatch", 8));
 		const opts = {
 			maxEdge: getPref<number>("maxEdge", 1536),
@@ -586,7 +634,8 @@ export class Indexer {
 		let batchBytes = 0;
 		const inflight = new Set<Promise<unknown>>();
 		let uploadError: unknown = null;
-		let marked = false;
+		let firstPage: PageDoc | undefined;
+		const seen = new Set<number>();
 		let uploaded = 0;
 		let total = 0;
 		let done = 0;
@@ -598,12 +647,9 @@ export class Indexer {
 			batch = [];
 			batchBytes = 0;
 			while (inflight.size >= UPLOADS_IN_FLIGHT) await Promise.race(inflight);
-			if (!marked) {
-				// Record the attachment before the first upload so an interrupted index can still be removed later.
-				marked = true;
-				this.state.set(sk, { libraryID: item.libraryID, key: item.key, hash, pages: 0, totalPages: total, kind, at: Date.now(), status: "partial" });
-				void this.saveState();
-			}
+			this.checkJob(job);
+			if (signal.cancelled) throw new JobCancelled();
+			if (uploadError) throw uploadError;
 			const started = Date.now();
 			const p: Promise<unknown> = this.bridge.upsert(docs)
 				.then(() => {
@@ -617,16 +663,20 @@ export class Indexer {
 		};
 		const onPage = async (p: RenderedPage) => {
 			if (uploadError) throw uploadError;
-			if (parentSignal.cancelled) signal.cancelled = true;
+			this.checkJob(job);
+			if (signal.cancelled) throw new JobCancelled();
+			if (seen.has(p.page)) throw new Error("Renderer returned a duplicate page");
+			seen.add(p.page);
 			total = p.pageCount;
 			done++;
 			lastProgress = Date.now();
 			this.current = { itemID: item.id, title, page: done, total };
 			this.setProgressText(`${title} — page ${done}/${total}`);
 			this.setProgressPercent(Math.round((done / Math.min(total, opts.maxPages)) * 100));
-			batch.push({
+			const doc: PageDoc = {
 				_id: pageDocID(item.libraryID, item.key, p.page),
 				library_id: item.libraryID,
+				library_key: libraryKey(item.libraryID),
 				attachment_key: item.key,
 				item_key: itemKey,
 				page: p.page,
@@ -634,7 +684,10 @@ export class Indexer {
 				title,
 				file_hash: hash,
 				page_image_b64: p.jpegB64,
-			});
+			};
+			// Page 1 is the commit record: publish it only after every other page succeeded.
+			if (p.page === 1) { firstPage = doc; return; }
+			batch.push(doc);
 			batchBytes += p.jpegB64.length;
 			if (batch.length >= batchPages || batchBytes >= BATCH_B64_BYTES) await flush();
 		};
@@ -664,6 +717,7 @@ export class Indexer {
 			}, docTimeoutMs);
 		});
 		let result: { rendered: number; total: number };
+		let renderedSuccessfully = false;
 		try {
 			const render = kind === "pdf"
 				? this.renderer.renderPdf(path, opts, onPage)
@@ -674,13 +728,25 @@ export class Indexer {
 			stallLimit = UPLOAD_STALL_TIMEOUT_MS;
 			this.setProgressText(`${title} — uploading ${result.rendered - uploaded} page(s)…`);
 			await Promise.race([Promise.all(inflight), stalled, docTimeout]);
+			renderedSuccessfully = true;
 		}
 		finally {
 			if (watchdog) clearTimeout(watchdog);
 			if (docTimer) clearTimeout(docTimer);
+			// Prevent late renderer callbacks from starting uploads after a failure, and
+			// drain requests already sent before a retry or a final removal can proceed.
+			if (!renderedSuccessfully) signal.cancelled = true;
+			await Promise.allSettled(inflight);
 		}
 		if (uploadError) throw uploadError;
-		if (parentSignal.cancelled || signal.cancelled) return;
+		this.checkJob(job);
+		if (!firstPage || result.rendered !== Math.min(result.total, opts.maxPages)
+			|| seen.size !== result.rendered || uploaded !== result.rendered - 1
+			|| [...seen].some((page) => page < 1 || page > result.rendered)) {
+			throw new Error("Renderer did not produce the complete expected page set");
+		}
+		await this.bridge.upsert([{ ...firstPage, indexed_pages: result.rendered }]);
+		this.checkJob(job);
 
 		this.state.set(sk, {
 			libraryID: item.libraryID,
@@ -697,43 +763,45 @@ export class Indexer {
 	}
 
 	async remove(libraryID: number, key: string) {
-		const sk = stateKey(libraryID, key);
-		// Also issue the delete for attachments without local state: an interrupted or crashed
-		// index may have uploaded pages before the state entry was written.
-		try {
-			await this.bridge.deleteAttachments(libraryID, [key]);
-			this.state.delete(sk);
-			await this.saveState();
-			log(`removed ${libraryID}/${key} from index`);
-			this.onChange?.();
-		}
-		catch (e) {
-			logError("remove", e);
-			this.pendingDeletes.push({ libraryID, key });
-			await this.saveState();
-		}
+		await this.requestRemoval({ libraryID, libraryKey: libraryKey(libraryID), key });
 	}
 
-	/** Drop every page of a library (group removed from Zotero). */
-	async removeLibrary(libraryID: number) {
-		for (const k of [...this.state.keys()]) if (k.startsWith(`${libraryID}/`)) this.state.delete(k);
+	/** Group deletion supplies its stable ID because the local library may already be gone. */
+	async removeLibrary(libraryID: number, remoteKey = libraryKey(libraryID)) {
+		await this.requestRemoval({ libraryID, libraryKey: remoteKey });
+	}
+
+	private async requestRemoval(deletion: PendingDelete) {
+		const { libraryID, key } = deletion;
+		// Preference observers normally do this synchronously; cover direct callers too.
+		void this.resetStateIfTargetChanged();
+		for (const [id, timer] of this.pending) {
+			const item = Zotero.Items.get(id);
+			if (!item || (item.libraryID === libraryID && (!key || item.key === key))) {
+				clearTimeout(timer);
+				this.pending.delete(id);
+			}
+		}
+		const active = this.activeJob;
+		if (active && active.libraryID === libraryID && (!key || active.key === key)) active.signal.cancelled = true;
+		this.queue = this.queue.filter((job) => {
+			const item = Zotero.Items.get(job.itemID);
+			const keep = item && (item.libraryID !== libraryID || (key && item.key !== key));
+			if (!keep) this.queued.delete(job.itemID);
+			return keep;
+		});
+		for (const [k, value] of this.state) if (value.libraryID === libraryID && (!key || value.key === key)) this.state.delete(k);
 		this.reconciled.delete(libraryID);
-		try {
-			await this.bridge.deleteLibrary(libraryID);
-			log(`removed library ${libraryID} from index`);
-		}
-		catch (e) {
-			logError("removeLibrary", e);
-			this.pendingDeletes.push({ libraryID });
-		}
-		await this.saveState();
+		if (!this.hasPendingDelete(libraryID, key)) this.pendingDeletes.push(deletion);
+		await this.saveState(true);
 		this.onChange?.();
+		await this.flushPendingDeletes();
 	}
 
 	/** Resolves once the queue is drained (used by tests). */
 	async whenIdle(timeoutMs = 600000) {
 		const deadline = Date.now() + timeoutMs;
-		while ((this.running || this.queue.length || this.pending.size) && Date.now() < deadline) await delay(200);
+		while ((this.running || this.queue.length || this.pending.size || this.deleting) && Date.now() < deadline) await delay(200);
 	}
 
 	// ----------------------------------------------------------------------

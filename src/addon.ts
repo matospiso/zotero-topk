@@ -107,7 +107,12 @@ export class TopKAddon {
 	// ----------------------------------------------------------------------
 
 	async testConnection() {
-		return this.bridge.testConnection();
+		const result = await this.bridge.testConnection();
+		void this.indexer.retryPendingDeletes().catch((e) => logError("deletions after connection", e));
+		if (getPref<boolean>("autoIndex", true)) {
+			void this.indexer.indexAllLibraries({ force: false }).catch((e) => logError("sync after connection", e));
+		}
+		return result;
 	}
 
 	getStatusText(): string {
