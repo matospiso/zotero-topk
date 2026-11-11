@@ -5,7 +5,7 @@ var chromeHandle = null;
 const RESOURCE_HOST = "zotero-topk";
 const PREF_KEYS = [
 	"apiKey", "region", "host", "collection", "nodePath", "autoIndex", "indexSnapshots", "maxPages", "maxEdge",
-	"jpegQuality", "resultLimit", "renderConcurrency", "uploadBatch", "maxFileMB", "docTimeoutMinutes", "debug",
+	"jpegQuality", "resultLimit", "renderConcurrency", "uploadBatch", "uploadConcurrency", "maxFileMB", "docTimeoutMinutes", "debug",
 	"bridgeFake", "selftest",
 ];
 

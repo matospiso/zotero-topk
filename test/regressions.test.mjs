@@ -11,7 +11,7 @@ import path from 'node:path';
 
 const bundle = (await build({ stdin: { contents: `export * from './src/indexer'; export * from './src/bridge'; export * from './src/search'; export * from './src/itemPane'; export * from './src/addon'; export * from './src/library'; export * from './src/selftest';`, resolveDir: process.cwd() }, bundle: true, write: false, format: 'cjs', platform: 'node', define: { __DEV__: 'false' } })).outputFiles[0].text;
 const backendContext = vm.createContext({ require: createRequire(new URL('../bridge/server.js', import.meta.url)), process: { env: { TOPK_BRIDGE_TOKEN: 'x'.repeat(32) } }, console, Buffer, setTimeout });
-vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('const backend = FAKE')[0] + '\nglobalThis.FakeBackend = FakeBackend; globalThis.TopKBackend = TopKBackend; globalThis.serializeMutation = serializeMutation;', backendContext);
+vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('const backend = FAKE')[0] + '\nglobalThis.FakeBackend = FakeBackend; globalThis.TopKBackend = TopKBackend; globalThis.scheduled = scheduled; globalThis.SCOPE = SCOPE;', backendContext);
 const defer = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 const tick = () => new Promise((r) => setImmediate(r));
 async function until(predicate) { for (let i = 0; i < 1000; i++) { if (predicate()) return; await tick(); } throw new Error('condition did not become true'); }
@@ -203,14 +203,50 @@ test('deletion self-test passes only when local state and all remote pages are a
  assert.equal(result.stillIndexed,false); assert.equal(result.remoteExists,false);
 });
 
-test('backend mutation ordering survives a disconnected upload caller', async () => {
- const gate = defer(); const order = [];
- const upload = backendContext.serializeMutation(async () => { order.push('upload started'); await gate.promise; order.push('upload finished'); });
- const remove = backendContext.serializeMutation(async () => { order.push('deleted'); });
- // The HTTP caller can time out and stop awaiting this promise; the backend must still drain it.
- const abandoned = upload(); await tick(); const deleting = remove(); await tick();
- assert.deepEqual(order,['upload started']); gate.resolve(); await deleting; await abandoned;
- assert.deepEqual(order,['upload started','upload finished','deleted']);
+test('backend request ordering is scoped: uploads overlap, deletions wait for their attachment, configure waits for all', async () => {
+ const { scheduled, SCOPE } = backendContext; const gate = defer(); const order = [];
+ const upload = scheduled(SCOPE.upload, async ({ docs }) => { order.push(`upload ${docs[0].attachment_key} started`); await gate.promise; order.push(`upload ${docs[0].attachment_key} finished`); });
+ const remove = scheduled(SCOPE.attachments, async ({ attachmentKeys }) => { order.push(`deleted ${attachmentKeys.join()}`); });
+ const removeLibrary = scheduled(SCOPE.library, async ({ libraryKey }) => { order.push(`deleted ${libraryKey}`); });
+ const configure = scheduled(SCOPE.all, async () => { order.push('configured'); });
+ const doc = (key, library = 'user:17') => ({ docs: [{ library_key: library, attachment_key: key }] });
+ // The HTTP caller can time out and stop awaiting an upload; the backend must still order deletions after it.
+ const abandoned = upload(doc('A')); const other = upload(doc('B')); await tick();
+ assert.deepEqual(order,['upload A started','upload B started']);
+ const deletingA = remove({ libraryKey: 'user:17', attachmentKeys: ['A'] });
+ const deletingC = remove({ libraryKey: 'user:17', attachmentKeys: ['C'] });
+ const deletingGroup = removeLibrary({ libraryKey: 'group:42' });
+ const laterA = upload(doc('A')); const configuring = configure({}); const afterConfigure = upload(doc('D'));
+ await tick(); await tick();
+ // Unrelated scopes proceed at once; A's deletion, the later A upload and the configure wait in order.
+ assert.deepEqual(order,['upload A started','upload B started','deleted C','deleted group:42']);
+ gate.resolve(); await Promise.all([abandoned, other, deletingA, deletingC, deletingGroup, laterA, configuring, afterConfigure]);
+ assert.deepEqual(order.slice(4),['upload A finished','upload B finished','deleted A','upload A started','upload A finished','configured','upload D started','upload D finished']);
+});
+
+test('uploads of one attachment are in flight together and the next attachment renders while they drain', async (t) => {
+ const h = await harness(t); const a = h.addItem(1,'AAAAAAAA'); const b = h.addItem(1,'BBBBBBBB');
+ const gate = defer(); let started = 0; const original = h.backend.upsert.bind(h.backend);
+ h.backend.upsert = async (body) => { started++; await gate.promise; return original(body); };
+ h.indexer.enqueue(a,false); h.indexer.enqueue(b,false);
+ await until(() => started >= 2); // pages 2 and 3 of A (uploadBatch 1) are sent without waiting for each other
+ await until(() => h.renderer.calls === 2); // B is rendered while A's uploads are still outstanding
+ assert.equal(h.indexer.getState(a)?.status,'partial'); assert.equal(h.backend.docs.size,0);
+ gate.resolve(); await h.idle();
+ assert.equal(h.indexer.getState(a)?.status,'ok'); assert.equal(h.indexer.getState(b)?.status,'ok'); assert.equal(h.backend.docs.size,6);
+ const commits = h.requests.filter((r) => r.route === '/upsert' && r.body.docs.some((d) => d.indexed_pages));
+ assert.deepEqual(commits.map((r) => r.body.docs[0].attachment_key),['AAAAAAAA','BBBBBBBB']);
+});
+
+test('a destination change waits for in-flight uploads and later requests wait for it', async (t) => {
+ const h = await harness(t); const item = h.addItem(); const gate = defer(); let started = 0; const original = h.backend.upsert.bind(h.backend);
+ h.backend.upsert = async (body) => { started++; await gate.promise; return original(body); };
+ h.indexer.enqueue(item,false); await until(() => started >= 2);
+ h.bridge.configured = false; const reconfigure = h.bridge.ensureReady(); const read = h.bridge.status(); await tick(); await tick();
+ assert.equal(h.requests.filter((r) => r.route === '/configure').length,1); assert.equal(h.requests.filter((r) => r.route === '/status').length,0);
+ gate.resolve(); await reconfigure; await read; await h.idle();
+ assert.deepEqual(h.requests.filter((r) => r.route === '/configure' || r.route === '/status').map((r) => r.route),['/configure','/configure','/status']);
+ assert.equal(h.indexer.getState(item)?.status,'ok');
 });
 
 test('real backend uses stable scopes and completion markers, including partial-page deletion', async () => {

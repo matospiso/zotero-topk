@@ -212,7 +212,9 @@ class TopKBackend {
 			const { page_image_b64, ...rest } = d;
 			return { ...rest, page_image: image(Buffer.from(page_image_b64, "base64")) };
 		});
-		const lsn = await withRetry("upsert", () => this._col().upsert(payload));
+		// Bound to the collection of the moment the request was accepted: a retry never crosses into another destination.
+		const col = this._col();
+		const lsn = await withRetry("upsert", () => col.upsert(payload));
 		this.lastLsn = lsn;
 		this.lastLsnAt = Date.now();
 		return { ok: true, lsn, count: payload.length };
@@ -435,28 +437,51 @@ class FakeBackend {
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
-// A client HTTP timeout does not cancel a TopK write. Keep mutations and
-// reconfiguration ordered here too, so a late upload cannot follow its deletion.
-let mutations = Promise.resolve();
-function serializeMutation(fn) {
-	return (...args) => {
-		const result = mutations.then(() => fn(...args));
-		mutations = result.catch(() => {});
-		return result;
+// A client HTTP timeout does not cancel a TopK write, so request ordering is enforced here, by
+// attachment scope. Uploads run concurrently with each other (the client, not this process, sets
+// the pace; TopK applies backpressure through transient errors that withRetry() honours). A
+// deletion waits for earlier uploads or deletions of the same attachments and later ones wait for
+// it, so a late upload cannot follow its deletion. Reconfiguration waits for every earlier request
+// and blocks every later one, so nothing crosses into another destination.
+const inflight = [];
+function overlaps(a, b) {
+	// "lib" covers the whole library; "lib/KEY" one attachment. Library keys never contain "/".
+	return a === b || a.startsWith(b + "/") || b.startsWith(a + "/");
+}
+function conflicts(a, b) {
+	if (a.all || b.all) return true;
+	if (a.upload && b.upload) return false;
+	return a.scopes.some((s) => b.scopes.some((t) => overlaps(s, t)));
+}
+function scheduled(scopeOf, fn) {
+	return (body) => {
+		const entry = { all: false, upload: false, scopes: [], ...scopeOf(body) };
+		const earlier = inflight.filter((e) => conflicts(e, entry));
+		const run = Promise.all(earlier.map((e) => e.settled)).then(() => fn(body));
+		entry.settled = run.then(() => {}, () => {});
+		inflight.push(entry);
+		return run.finally(() => inflight.splice(inflight.indexOf(entry), 1));
 	};
 }
+const list = (v) => (Array.isArray(v) ? v : []);
+const SCOPE = {
+	all: () => ({ all: true }),
+	upload: (body) => ({ upload: true, scopes: list(body.docs).map((d) => `${d && d.library_key}/${d && d.attachment_key}`) }),
+	attachments: (body) => ({ scopes: list(body.attachmentKeys).map((k) => `${body.libraryKey}/${k}`) }),
+	library: (body) => ({ scopes: [String(body.libraryKey)] }),
+};
 
 const backend = FAKE ? new FakeBackend() : new TopKBackend();
 
 const ROUTES = {
 	"GET /health": async () => ({ ok: true, version: BRIDGE_VERSION, fake: FAKE, configured: backend.configured }),
 	"GET /status": () => backend.status(),
-	"POST /configure": serializeMutation((body) => backend.configure(body)),
-	"POST /upsert": serializeMutation((body) => backend.upsert(body)),
+	"POST /configure": scheduled(SCOPE.all, (body) => backend.configure(body)),
+	"POST /upsert": scheduled(SCOPE.upload, (body) => backend.upsert(body)),
 	"POST /search": (body) => backend.search(body),
 	"POST /images": (body) => backend.images(body),
-	"POST /delete": serializeMutation((body) => backend.deleteAttachments(body)),
-	"POST /delete-library": serializeMutation((body) => backend.deleteLibrary(body)),
+	"POST /delete": scheduled(SCOPE.attachments, (body) => backend.deleteAttachments(body)),
+	"POST /delete-library": scheduled(SCOPE.library, (body) => backend.deleteLibrary(body)),
 	"POST /manifest": (body) => backend.manifest(body),
 	"POST /attachment-status": (body) => backend.hasAttachment(body),
 	"POST /shutdown": async () => {
