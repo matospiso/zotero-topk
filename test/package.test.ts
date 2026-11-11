@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { request as httpRequest } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
-import { TopKBackend } from "../bridge/server";
+import { createRequire } from "node:module";
 import { version } from "../package.json";
+import { BRIDGE_READY_PREFIX, type BridgeReady } from "../shared/protocol";
 
 let extracted: string;
 beforeAll(() => {
@@ -30,17 +31,48 @@ test("XPI exposes Zotero lifecycle callbacks and compiled default preferences", 
 	assert.equal(prefs.get("extensions.zotero-topk.uploadConcurrency"), 4);
 	assert.equal(prefs.has("extensions.zotero-topk.bunPath"), false);
 	const renderer = readFileSync(join(extracted, "content/renderer.js"), "utf8");
-	assert.ok(renderer.includes('"./pdfjs/pdf.mjs"'));
+	assert.match(renderer, /from\s+["']\.\/pdfjs\/pdf\.mjs["']/);
 	assert.ok(!renderer.includes('from "pdfjs-dist"'));
 });
 
+test("packaged uninstall removes declared preferences and external files", async () => {
+	const declaredPrefs = new Set<string>();
+	vm.runInNewContext(readFileSync(join(extracted, "prefs.js"), "utf8"), { pref: (key: string) => declaredPrefs.add(key) });
+	const cleared: Array<{ key: string; global: boolean }> = [];
+	const removed: Array<{ path: string; ignoreAbsent: boolean; recursive: boolean }> = [];
+	const errors: string[] = [];
+	const context = vm.createContext({
+		ADDON_UNINSTALL: 6,
+		Zotero: {
+			DataDirectory: { dir: "/zotero-data" },
+			Prefs: { clear: (key: string, global: boolean) => cleared.push({ key, global }) },
+			debug: (message: string) => errors.push(message),
+		},
+		PathUtils: { join },
+		IOUtils: { remove: async (path: string, options: { ignoreAbsent: boolean; recursive?: boolean }) => {
+			removed.push({ path, ignoreAbsent: options.ignoreAbsent, recursive: options.recursive === true });
+		} },
+	});
+	vm.runInContext(readFileSync(join(extracted, "bootstrap.js"), "utf8"), context);
+	await context.uninstall({}, 7);
+	assert.equal(cleared.length, 0);
+	assert.equal(removed.length, 0);
+	await context.uninstall({}, 6);
+	assert.deepEqual(cleared.map(({ key }) => key).sort(), [...declaredPrefs].sort());
+	assert.equal(cleared.every(({ global }) => global), true);
+	assert.deepEqual(removed, [
+		{ path: join("/zotero-data", "topk-index-state.json"), ignoreAbsent: true, recursive: false },
+		{ path: join("/zotero-data", "topk-index-state.json.tmp"), ignoreAbsent: true, recursive: false },
+		{ path: join("/zotero-data", "topk-bridge"), ignoreAbsent: true, recursive: true },
+	]);
+	assert.equal(errors.length, 0);
+});
+
 test("the pinned native TopK SDK loads under Node without credentials or network", () => {
-	const backend = new TopKBackend();
-	const sdk = backend._sdk();
+	const sdk = createRequire(new URL("../bridge/package.json", import.meta.url))("topk-js");
 	const client = new sdk.Client({ apiKey: "never-provisioned-test-key", region: "aws-us-east-1-elastica" });
-	assert.ok(client.collection("compatibility-probe"));
-	assert.ok(sdk.data.image(readFileSync("addon/content/icons/topk-48.png")));
-	assert.ok(backend._schema().page_image);
+	assert.notEqual(client.collection("compatibility-probe"), undefined);
+	assert.notEqual(sdk.data.image(readFileSync("addon/content/icons/topk-48.png")), undefined);
 });
 
 test("production plugin bundle loads as a classic Gecko script and ignores the fake preference", async () => {
@@ -58,20 +90,23 @@ test("production plugin bundle loads as a classic Gecko script and ignores the f
 test("packaged Node helper serves authenticated requests and exits when its parent pipe closes", { timeout: 10000 }, async () => {
 	const token = "test-session-token-".repeat(3);
 	const child = spawn(process.execPath, ["server.js"], {
-		cwd: join(extracted, "bridge"), env: { ...process.env, TOPK_BRIDGE_TOKEN: token, TOPK_BRIDGE_FAKE: "1" },
+		cwd: join(extracted, "bridge"),
+		env: { ...process.env, TOPK_BRIDGE_TOKEN: token, TOPK_BRIDGE_FAKE: "1" },
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	const exited = once(child, "exit");
-	let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
+	let stderr = "";
+	child.stderr.on("data", (chunk) => { stderr += chunk; });
 	try {
 		let stdout = "";
 		for await (const chunk of child.stdout) {
 			stdout += chunk;
 			if (stdout.includes("\n")) break;
 		}
-		const match = stdout.match(/TOPK_BRIDGE_READY (.+)\n/);
-		assert.ok(match, `Helper exited before READY: ${stderr}`);
-		const ready = JSON.parse(match[1]);
+		assert.ok(stdout, `Helper exited before READY: ${stderr}`);
+		assert.equal(stdout.startsWith(BRIDGE_READY_PREFIX), true);
+		const ready: BridgeReady = JSON.parse(stdout.slice(BRIDGE_READY_PREFIX.length).split("\n")[0]);
+		assert.equal(ready.version, version);
 		assert.equal(ready.fake, true);
 		const base = `http://127.0.0.1:${ready.port}`;
 		const request = (route: string, body?: unknown, headers = {}) => fetch(base + route, {

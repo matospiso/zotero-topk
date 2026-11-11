@@ -1,18 +1,16 @@
-import { getPref, delay } from "./prefs";
+import { getPref, getPrefs } from "./prefs";
+import { withTimeout } from "../shared/async";
+import { DESTINATION_PREFS } from "../shared/preferences";
+import { HELPER_FILES } from "../shared/runtime";
+import { HOST_LABEL, HOST_NAME, COLLECTION_NAME } from "../shared/configuration";
 import { libraryKey, localLibraryID } from "./library";
 import { log, logError, errorMessage, debug } from "./log";
 
-import type { SearchHit, PageDoc, ManifestRow } from "../shared/protocol";
-export type { SearchHit, PageDoc, ManifestRow } from "../shared/protocol";
+import { BRIDGE_READY_PREFIX, type BridgeReady, type SearchHit, type PageDoc, type BridgeRequests, type BridgeResponses, type BridgePath, type BridgeMethod } from "../shared/protocol";
 
 export function destination() {
-	return {
-		apiKey: getPref<string>("apiKey", ""),
-		region: getPref<string>("region", ""),
-		collection: getPref<string>("collection", ""),
-		host: getPref<string>("host", "").trim() || "topk.io",
-		fake: __DEV__ && getPref<boolean>("bridgeFake", false),
-	};
+	const { bridgeFake, ...config } = getPrefs(DESTINATION_PREFS);
+	return { ...config, host: config.host.trim() || "topk.io", fake: __DEV__ && bridgeFake };
 }
 
 function configKey({ apiKey, region, collection, host }: ReturnType<typeof destination>) {
@@ -32,10 +30,6 @@ export class BridgeError extends Error {
 
 const { Subprocess } = ChromeUtils.importESModule("resource://gre/modules/Subprocess.sys.mjs");
 
-// Region and host are interpolated into https://<region>.api.<host>; accept hostname syntax only.
-const HOST_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?$/;
-const HOST_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/;
-const COLLECTION_NAME = /^[A-Za-z0-9_-]{1,128}$/;
 // Environment variables the helper legitimately needs (everything else from Zotero's environment is withheld).
 const CHILD_ENV_ALLOWLIST = [
 	"PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
@@ -44,7 +38,6 @@ const CHILD_ENV_ALLOWLIST = [
 	"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
 ];
 
-/** Cryptographically random token (hex) for the loopback channel. */
 function randomToken(bytes = 32): string {
 	const gen = Components.classes["@mozilla.org/security/random-generator;1"]
 		.getService(Components.interfaces.nsIRandomGenerator);
@@ -96,10 +89,6 @@ class OperationLock {
 
 const DESTINATION_CHANGED = Symbol("destination changed");
 
-/**
- * Manages the local Node.js helper that hosts the TopK JavaScript SDK and
- * exposes a tiny JSON API on 127.0.0.1.
- */
 export class Bridge {
 	private proc: any = null;
 	private port = 0;
@@ -119,14 +108,6 @@ export class Bridge {
 		return !!this.proc && this.port > 0;
 	}
 
-	get isConfigured() {
-		return this.running && this.configured;
-	}
-
-	// ----------------------------------------------------------------------
-	// Lifecycle
-	// ----------------------------------------------------------------------
-
 	async ensureRunning(): Promise<void> {
 		if (this.running) return;
 		if (!this.startPromise) {
@@ -135,9 +116,9 @@ export class Bridge {
 		return this.startPromise;
 	}
 
-	/** Make sure the helper runs and is configured with the current preferences. */
 	async ensureReady(): Promise<void> {
-		await this.operation();
+		const config = destination();
+		if (!this.configuredFor(configKey(config))) await this.lock.runExclusive(() => this.configure(config));
 	}
 
 	private async configure(config: ReturnType<typeof destination>): Promise<void> {
@@ -178,7 +159,7 @@ export class Bridge {
 		this.configured = false;
 		if (!proc) return;
 		try {
-			await Promise.race([proc.kill(1500), delay(2500)]);
+			await withTimeout(proc.kill(1500), 2500, () => new Error("Helper shutdown timed out"));
 		}
 		catch (e) {
 			// already gone
@@ -192,15 +173,6 @@ export class Bridge {
 		this.port = 0;
 		try { proc?.kill(0); } catch (e) {}
 	}
-
-	async restart() {
-		await this.stop();
-		await this.ensureRunning();
-	}
-
-	// ----------------------------------------------------------------------
-	// Node / dependency management
-	// ----------------------------------------------------------------------
 
 	private async fileExists(path: string): Promise<boolean> {
 		try {
@@ -239,7 +211,7 @@ export class Bridge {
 
 	private async candidateNodePaths(): Promise<string[]> {
 		const out: string[] = [];
-		const configured = getPref<string>("nodePath", "").trim();
+		const configured = getPref("nodePath").trim();
 		if (configured) out.push(configured);
 		try {
 			const found = await Subprocess.pathSearch(Zotero.isWin ? "node.exe" : "node");
@@ -251,7 +223,6 @@ export class Bridge {
 			: (Services.env.get("HOME") || "");
 		const versionDirs = async (base: string, suffix: string[]) => {
 			const children = await this.listDir(base);
-			// Highest version first
 			children.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
 			for (const c of children) out.push(PathUtils.join(c, ...suffix));
 		};
@@ -320,7 +291,7 @@ export class Bridge {
 	private async prepareBridgeDir(): Promise<string> {
 		const dir = PathUtils.join(Zotero.DataDirectory.dir, "topk-bridge");
 		await IOUtils.makeDirectory(dir, { ignoreExisting: true });
-		for (const name of ["server.js", "package.json", "package-lock.json"]) {
+		for (const name of HELPER_FILES) {
 			// getResourceAsync goes through an nsIChannel, so it also works for jar: URLs (installed xpi).
 			const src = await Zotero.File.getResourceAsync(`${this.rootURI}bridge/${name}`);
 			await IOUtils.writeUTF8(PathUtils.join(dir, name), src);
@@ -379,13 +350,9 @@ export class Bridge {
 		}
 	}
 
-	// ----------------------------------------------------------------------
-	// Process
-	// ----------------------------------------------------------------------
-
 	private async spawn(): Promise<void> {
 		this.token = randomToken(32);
-		const fake = __DEV__ && getPref<boolean>("bridgeFake", false);
+		const fake = __DEV__ && getPref("bridgeFake");
 		const extra: Record<string, string> = { TOPK_BRIDGE_TOKEN: this.token };
 		if (fake) extra.TOPK_BRIDGE_FAKE = "1";
 		const proc = await Subprocess.call({
@@ -399,7 +366,6 @@ export class Bridge {
 		this.proc = proc;
 		this.configured = false;
 
-		// Forward stderr to the Zotero debug log.
 		(async () => {
 			try {
 				let chunk: string;
@@ -410,25 +376,23 @@ export class Bridge {
 			catch (e) {}
 		})();
 
-		// Wait for the ready line on stdout.
-		const ready = (async () => {
+		const ready = (async (): Promise<BridgeReady> => {
 			let buf = "";
 			let chunk: string;
 			while ((chunk = await proc.stdout.readString())) {
 				buf = (buf + chunk).slice(-16384);
-				const m = buf.match(/TOPK_BRIDGE_READY (\{[^\n]*\})/);
-				if (m) {
-					const info = JSON.parse(m[1]);
+				const line = buf.split("\n").find((value) => value.startsWith(BRIDGE_READY_PREFIX) && value.endsWith("}"));
+				if (line) {
+					const info: BridgeReady = JSON.parse(line.slice(BRIDGE_READY_PREFIX.length));
 					if (!Number.isInteger(info.port) || info.port <= 0 || info.port > 65535) throw new BridgeError("bridge reported an invalid port");
 					return info;
 				}
 			}
 			throw new BridgeError("bridge exited before becoming ready");
 		})();
-		const timeout = delay(30000).then(() => { throw new BridgeError("timed out waiting for the bridge to start"); });
-		let info: any;
+		let info: BridgeReady;
 		try {
-			info = await Promise.race([ready, timeout]);
+			info = await withTimeout(ready, 30000, () => new BridgeError("timed out waiting for the bridge to start"));
 		}
 		catch (e) {
 			try { proc.kill(0); } catch (e2) {}
@@ -453,11 +417,7 @@ export class Bridge {
 		}).catch(() => {});
 	}
 
-	// ----------------------------------------------------------------------
-	// HTTP
-	// ----------------------------------------------------------------------
-
-	async request(method: "GET" | "POST", path: string, body?: unknown, timeout = 120000): Promise<any> {
+	async request<P extends BridgePath>(method: BridgeMethod<P>, path: P, body: BridgeRequests[P], timeout = 120000): Promise<BridgeResponses[P]> {
 		if (!this.running) throw new BridgeError("bridge is not running");
 		const url = `http://127.0.0.1:${this.port}${path}`;
 		try {
@@ -491,27 +451,23 @@ export class Bridge {
 	// The destination is fixed when the operation is issued. Configuring the helper for it runs
 	// exclusively; the request itself then runs alongside other requests, and is retried from the
 	// start if another caller moved the helper to a different destination in between.
-	private async operation(path?: string, body?: unknown, timeout = 120000): Promise<any> {
+	private async operation<P extends Exclude<BridgePath, "/configure" | "/health">>(path: P, body: BridgeRequests[P], timeout = 120000): Promise<BridgeResponses[P]> {
 		const config = destination();
 		const key = configKey(config);
-		if (!path) {
-			if (this.configuredFor(key)) return;
-			return this.lock.runExclusive(() => this.configure(config));
-		}
 		for (let attempt = 0; attempt < 3; attempt++) {
 			if (!this.configuredFor(key)) await this.lock.runExclusive(() => this.configure(config));
 			const result = await this.lock.runShared(async () => {
 				if (!this.configuredFor(key)) return DESTINATION_CHANGED;
-				return this.request(path === "/status" ? "GET" : "POST", path, body, timeout);
+				return this.request((path === "/status" ? "GET" : "POST") as BridgeMethod<P>, path, body, timeout);
 			});
 			if (result !== DESTINATION_CHANGED) return result;
 		}
 		throw new BridgeError("The TopK destination changed while the request was waiting");
 	}
 
-	async status() { return this.operation("/status"); }
+	async status() { return this.operation("/status", undefined); }
 
-	async upsert(docs: PageDoc[]): Promise<{ lsn: string }> {
+	async upsert(docs: PageDoc[]): Promise<BridgeResponses["/upsert"]> {
 		return this.operation("/upsert", { docs }, 300000);
 	}
 
@@ -525,7 +481,7 @@ export class Bridge {
 		});
 	}
 
-	async images(ids: string[]): Promise<Record<string, { format: string; b64: string }>> {
+	async images(ids: string[]): Promise<BridgeResponses["/images"]["images"]> {
 		return (await this.operation("/images", { ids }, 60000)).images;
 	}
 
@@ -538,7 +494,7 @@ export class Bridge {
 		await this.operation("/delete-library", { libraryKey: typeof library === "string" ? library : libraryKey(library) }, 300000);
 	}
 
-	async manifest(libraryID: number): Promise<{ rows: ManifestRow[]; complete: boolean }> {
+	async manifest(libraryID: number): Promise<BridgeResponses["/manifest"]> {
 		return this.operation("/manifest", { libraryKey: libraryKey(libraryID) }, 300000);
 	}
 
@@ -546,10 +502,9 @@ export class Bridge {
 		return (await this.operation("/attachment-status", { libraryKey: libraryKey(libraryID), attachmentKey }, 300000)).exists;
 	}
 
-	async testConnection(): Promise<any> {
+	async testConnection(): Promise<BridgeResponses["/status"]> {
 		try {
 			await this.ensureRunning();
-			// Force a (re)configure so a changed key/collection is picked up.
 			this.configured = false;
 			await this.ensureReady();
 			const status = await this.status();

@@ -5,6 +5,8 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noImplicitAny": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "skipLibCheck": true,
     "noEmit": true,
     "resolveJsonModule": true,

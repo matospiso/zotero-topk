@@ -5,7 +5,7 @@ export function log(msg: string) {
 }
 
 export function debug(msg: string) {
-	if (getPref<boolean>("debug", false)) Zotero.debug(`[TopK] ${msg}`);
+	if (getPref("debug")) Zotero.debug(`[TopK] ${msg}`);
 }
 
 export function logError(context: string, e: unknown) {

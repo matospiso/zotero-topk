@@ -1,11 +1,9 @@
-// Generates the PNG icons referenced by manifest.json (no external deps).
 import { deflateSync } from "node:zlib";
 import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { root } from "./project";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const out = join(here, "..", "addon", "content", "icons");
+const out = join(root, "addon", "content", "icons");
 mkdirSync(out, { recursive: true });
 
 function crc32(buf: Uint8Array) {

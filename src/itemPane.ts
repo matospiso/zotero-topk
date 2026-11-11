@@ -6,10 +6,6 @@ import { logError } from "./log";
 
 const PANE_ID = "zotero-topk-pages";
 
-/**
- * "TopK pages" item pane section: shows the matching pages (with thumbnails)
- * for the current search, or the index status of the item's attachments.
- */
 export class ItemPaneSection {
 	private registered: string | false = false;
 	private refreshers = new Map<any, () => void>();
@@ -42,7 +38,6 @@ export class ItemPaneSection {
 		}
 	}
 
-	/** Ask Zotero to re-render the section after search results change. */
 	refresh() {
 		for (const refresh of this.refreshers.values()) {
 			try { refresh(); } catch (e) {}

@@ -1,7 +1,11 @@
-import { Bridge, PageDoc, BridgeError, destinationKey } from "./bridge";
+import { Bridge, BridgeError, destinationKey } from "./bridge";
+import type { PageDoc } from "../shared/protocol";
 import { libraryKey } from "./library";
-import { Renderer, RenderedPage } from "./renderer";
-import { getPref, delay } from "./prefs";
+import { Renderer } from "./renderer";
+import { MAX_IMAGE_BYTES, type RenderedPage } from "../shared/rendering";
+import { getPref, PREF_PREFIX } from "./prefs";
+import { delay } from "../shared/async";
+import { DESTINATION_PREFS } from "../shared/preferences";
 import { log, logError, errorMessage, debug } from "./log";
 
 export type AttachmentKind = "pdf" | "html";
@@ -39,7 +43,6 @@ const MAX_FAILED_VERSIONS = 3; // give up on a file version after this many non-
 // author cannot influence scheduling through the text of a parser error.
 const TRANSIENT_ERROR = /Unavailable|temporarily unavailable|QuotaExceeded|Too many requests|timed out|timeout|deadline|transport|connection|bridge is not running|bridge exited/i;
 const SETUP_ERROR = /API key|not configured|Node\.js|npm|Invalid TopK|Invalid collection/i;
-const STATE_PREFS = ["apiKey", "region", "host", "collection", "bridgeFake"];
 
 class JobCancelled extends Error {}
 
@@ -58,7 +61,6 @@ function isSetupError(e: unknown, msg: string) {
 	return e instanceof BridgeError && SETUP_ERROR.test(msg);
 }
 
-const MAX_IMAGE_BYTES = 500 * 1024; // TopK limit is 512 KB
 const BATCH_B64_BYTES = 5 * 1024 * 1024; // stay below the 8 MB upsert limit even with base64 overhead
 const MAX_UPLOADS_IN_FLIGHT = 16;
 const STALL_TIMEOUT_MS = 4 * 60 * 1000; // no page progress for this long while rendering → give up on the document
@@ -75,7 +77,7 @@ export function classifyAttachment(item: any): AttachmentKind | null {
 	try {
 		if (!item || !item.isAttachment() || !item.isFileAttachment() || item.deleted) return null;
 		if (item.isPDFAttachment()) return "pdf";
-		if (item.attachmentContentType === "text/html") return getPref<boolean>("indexSnapshots", true) ? "html" : null;
+		if (item.attachmentContentType === "text/html") return getPref("indexSnapshots") ? "html" : null;
 	}
 	catch (e) {}
 	return null;
@@ -89,11 +91,6 @@ export function pageDocID(libraryID: number, key: string, page: number) {
 	return `${libraryKey(libraryID)}/${key}/${page}`;
 }
 
-/**
- * Keeps TopK in sync with the library: renders eligible attachments page by
- * page and upserts them, reacts to item changes, and remembers what has been
- * indexed (by content hash) in a small JSON file in the Zotero data directory.
- */
 export class Indexer {
 	private state = new Map<string, AttachmentState>();
 	private queue: Job[] = [];
@@ -125,33 +122,25 @@ export class Indexer {
 		return PathUtils.join(Zotero.DataDirectory.dir, "topk-index-state.json");
 	}
 
-	/** Identity of the TopK target the local state describes; each destination retains its own state and pending removals. */
-	private target(): string { return destinationKey(); }
-
 	private checkJob(job: ActiveJob) {
-		if (this.stopped || job.signal.cancelled || job.target !== this.target()) throw new JobCancelled();
+		if (this.stopped || job.signal.cancelled || job.target !== destinationKey()) throw new JobCancelled();
 	}
 
-	// ----------------------------------------------------------------------
-	// Lifecycle
-	// ----------------------------------------------------------------------
-
 	async start() {
-		this.lastTarget = this.target();
+		this.lastTarget = destinationKey();
 		await this.loadState();
 		this.notifierID = Zotero.Notifier.registerObserver(
 			{ notify: (event: string, type: string, ids: any[], extraData: any) => this.notify(event, type, ids, extraData) },
 			["item", "group"],
 			"zotero-topk"
 		);
-		// A different credential or destination must never inherit reconciliation or completed state.
-		for (const name of STATE_PREFS) {
-			this.prefObservers.push(Zotero.Prefs.registerObserver(`extensions.zotero-topk.${name}`, () => {
+		for (const name of DESTINATION_PREFS) {
+			this.prefObservers.push(Zotero.Prefs.registerObserver(PREF_PREFIX + name, () => {
 				void this.resetStateIfTargetChanged();
 			}, true));
 		}
 		void this.retryPendingDeletes();
-		if (getPref<boolean>("autoIndex", true)) {
+		if (getPref("autoIndex")) {
 			// Let Zotero finish starting up before scanning the library.
 			setTimeout(() => {
 				if (!this.stopped) this.indexAllLibraries({ force: false }).catch((e) => logError("initial sync", e));
@@ -178,10 +167,6 @@ export class Indexer {
 		void this.saveState(true);
 	}
 
-	// ----------------------------------------------------------------------
-	// State persistence
-	// ----------------------------------------------------------------------
-
 	private async loadState() {
 		try {
 			if (await IOUtils.exists(this.statePath)) {
@@ -195,7 +180,7 @@ export class Indexer {
 			}
 		}
 		catch (e) { logError("loadState", e); }
-		this.selectTarget(this.target());
+		this.selectTarget(destinationKey());
 	}
 
 	private selectTarget(target: string) {
@@ -224,14 +209,14 @@ export class Indexer {
 	}
 
 	getState(item: any): AttachmentState | undefined {
-		if (this.target() !== this.lastTarget) return undefined;
+		if (destinationKey() !== this.lastTarget) return undefined;
 		return this.state.get(stateKey(item.libraryID, item.key));
 	}
 
 	private lastTarget = "";
 
 	private async resetStateIfTargetChanged() {
-		const target = this.target();
+		const target = destinationKey();
 		if (target === this.lastTarget) return;
 		for (const job of this.activeJobs) job.signal.cancelled = true;
 		this.queue = [];
@@ -257,10 +242,6 @@ export class Indexer {
 		return parts.join(" ");
 	}
 
-	// ----------------------------------------------------------------------
-	// Notifier
-	// ----------------------------------------------------------------------
-
 	private notify(event: string, type: string, ids: any[], extraData: any) {
 		if (this.stopped) return;
 		if (type === "group") {
@@ -276,7 +257,7 @@ export class Indexer {
 		if (type !== "item") return;
 		try {
 			if (event === "add" || event === "modify") {
-				if (!getPref<boolean>("autoIndex", true)) return;
+				if (!getPref("autoIndex")) return;
 				for (const id of ids) this.scheduleItem(Number(id));
 			}
 			else if (event === "trash") {
@@ -314,17 +295,12 @@ export class Indexer {
 				}
 			}
 			else if (item.isRegularItem()) {
-				// Title changes etc.: nothing to do unless children are unindexed.
 				for (const att of Zotero.Items.get(item.getAttachments())) {
 					if (classifyAttachment(att) && !this.getState(att)) this.enqueue(att, false);
 				}
 			}
 		}, 3000) as any);
 	}
-
-	// ----------------------------------------------------------------------
-	// Queue
-	// ----------------------------------------------------------------------
 
 	enqueue(item: any, force: boolean) {
 		void this.resetStateIfTargetChanged();
@@ -340,7 +316,6 @@ export class Indexer {
 		void this.run();
 	}
 
-	/** Index (or re-index) every eligible attachment among `items` (parents are expanded). */
 	enqueueItems(items: any[], force: boolean) {
 		for (const item of items) {
 			if (item.isAttachment()) {
@@ -377,7 +352,7 @@ export class Indexer {
 						await active.done;
 					}
 				}
-				if (this.stopped || this.target() !== target) return;
+				if (this.stopped || destinationKey() !== target) return;
 				try {
 					if (d.key) await this.bridge.deleteAttachments(d.libraryKey, [d.key]);
 					else await this.bridge.deleteLibrary(d.libraryKey);
@@ -417,14 +392,13 @@ export class Indexer {
 		const items = await Zotero.Items.getAll(libraryID, false, false, false);
 		let n = 0;
 		for (const item of items) {
-			if (this.target() !== target) return;
+			if (destinationKey() !== target) return;
 			if (!classifyAttachment(item)) continue;
 			if (!force) {
 				const st = this.getState(item);
-				// Cheap pre-check: if we have state, the hash check happens when the job runs.
 				if (st && !(await this.needsReindex(item, st))) continue;
 			}
-			if (this.target() !== target) return;
+			if (destinationKey() !== target) return;
 			this.enqueue(item, force);
 			n++;
 		}
@@ -437,11 +411,11 @@ export class Indexer {
 		const target = this.lastTarget;
 		try {
 			const { rows, complete } = await this.bridge.manifest(libraryID);
-			if (this.target() !== target) return;
+			if (destinationKey() !== target) return;
 			if (complete) this.reconciled.add(libraryID);
 			let updated = 0;
 			for (const row of rows) {
-				if (this.target() !== target) return;
+				if (destinationKey() !== target) return;
 				if (row.library_key !== libraryKey(libraryID) || typeof row.attachment_key !== "string"
 					|| !Number.isInteger(row.indexed_pages) || row.indexed_pages < 1) continue;
 				if (this.hasPendingDelete(libraryID, row.attachment_key)) continue;
@@ -495,7 +469,7 @@ export class Indexer {
 					this.queued.delete(job.itemID);
 					if (!item || this.hasPendingDelete(item.libraryID, item.key)) continue;
 					let finish!: () => void;
-					const active: ActiveJob = { libraryID: item.libraryID, key: item.key, target: this.target(),
+					const active: ActiveJob = { libraryID: item.libraryID, key: item.key, target: destinationKey(),
 						signal: { cancelled: false }, done: new Promise<void>((resolve) => { finish = resolve; }) };
 					this.activeJobs.add(active);
 					let completion: Promise<void>;
@@ -520,14 +494,13 @@ export class Indexer {
 		}
 	}
 
-	/** Waits for an attachment's remaining uploads and commit record, records the outcome, and schedules a retry if warranted. */
 	private async settle(job: Job, item: any, active: ActiveJob, completion: Promise<void>, finish: () => void) {
 		try {
 			await completion;
 			this.lastError = "";
 		}
 		catch (e) {
-			if (!(e instanceof JobCancelled || active.signal.cancelled || active.target !== this.target())) {
+			if (!(e instanceof JobCancelled || active.signal.cancelled || active.target !== destinationKey())) {
 				this.lastError = errorMessage(e);
 				logError(`indexing ${item.key}`, e);
 				const attempt = (job.attempt || 1);
@@ -537,7 +510,7 @@ export class Indexer {
 					log(`will retry ${item.key} in ${wait / 1000}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
 					this.setProgressText(`Waiting for TopK… (${item.getDisplayTitle?.() || item.key})`);
 					await delay(wait);
-					if (!this.stopped && !active.signal.cancelled && active.target === this.target()) {
+					if (!this.stopped && !active.signal.cancelled && active.target === destinationKey()) {
 						this.queue.push({ itemID: job.itemID, force: job.force, attempt: attempt + 1 });
 						this.queued.add(job.itemID);
 						this.progressTotal++;
@@ -545,7 +518,7 @@ export class Indexer {
 				}
 				else {
 					this.setProgressText(`Failed: ${item.getDisplayTitle?.() || item.key} – ${this.lastError}`);
-					// Setup problems (no key, no Node.js): stop hammering, drop the queue.
+					// Setup problems (no key, no Node): stop hammering, drop the queue.
 					if (isSetupError(e, this.lastError)) {
 						this.queue = [];
 						this.queued.clear();
@@ -561,10 +534,6 @@ export class Indexer {
 			this.onChange?.();
 		}
 	}
-
-	// ----------------------------------------------------------------------
-	// Indexing one attachment
-	// ----------------------------------------------------------------------
 
 	private async fileHash(path: string): Promise<string> {
 		try {
@@ -585,7 +554,7 @@ export class Indexer {
 	private describe(item: any) {
 		const parent = item.parentItemID ? Zotero.Items.get(item.parentItemID) : null;
 		const title = (parent && parent.getDisplayTitle && parent.getDisplayTitle()) || item.getDisplayTitle?.() || item.attachmentFilename || item.key;
-		return { parent, title: String(title).slice(0, 500), itemKey: parent ? parent.key : item.key };
+		return { title: String(title).slice(0, 500), itemKey: parent ? parent.key : item.key };
 	}
 
 	/**
@@ -633,7 +602,7 @@ export class Indexer {
 		this.checkJob(job);
 		const recordFailure = async (e: unknown) => {
 			const msg = errorMessage(e);
-			if (!(e instanceof JobCancelled) && !isTransient(e, msg) && !job.signal.cancelled && job.target === this.target()) {
+			if (!(e instanceof JobCancelled) && !isTransient(e, msg) && !job.signal.cancelled && job.target === destinationKey()) {
 				// Remember the failure so a document that always fails is not re-rendered on every startup.
 				const attempts = (existing?.status === "failed" && existing.hash === hash ? existing.attempts || 0 : 0) + 1;
 				this.state.set(sk, { libraryID: item.libraryID, key: item.key, hash, pages: 0, totalPages: 0, kind, at: Date.now(), status: "failed", attempts, error: msg.slice(0, 300) });
@@ -653,9 +622,8 @@ export class Indexer {
 		}
 	}
 
-	/** Share the upload budget across documents, including their final completion records. */
 	private async startUpload(docs: PageDoc[], job: ActiveJob, check: () => void = () => {}) {
-		const limit = Math.max(1, Math.min(MAX_UPLOADS_IN_FLIGHT, getPref<number>("uploadConcurrency", 4)));
+		const limit = Math.max(1, Math.min(MAX_UPLOADS_IN_FLIGHT, getPref("uploadConcurrency")));
 		while (this.uploads.size >= limit) await Promise.race(this.uploads);
 		this.checkJob(job);
 		check();
@@ -674,17 +642,17 @@ export class Indexer {
 			get cancelled() { return cancelled || job.signal.cancelled; },
 			set cancelled(value: boolean) { cancelled = value; },
 		};
-		const batchPages = Math.max(1, getPref<number>("uploadBatch", 8));
+		const batchPages = Math.max(1, getPref("uploadBatch"));
 		const opts = {
-			maxEdge: getPref<number>("maxEdge", 1536),
-			quality: getPref<number>("jpegQuality", 85),
+			maxEdge: getPref("maxEdge"),
+			quality: getPref("jpegQuality"),
 			maxBytes: MAX_IMAGE_BYTES,
-			maxPages: Math.max(1, Math.min(5000, getPref<number>("maxPages", 500))),
-			maxFileBytes: Math.max(1, getPref<number>("maxFileMB", 200)) * 1048576,
-			concurrency: Math.max(1, getPref<number>("renderConcurrency", 8)),
+			maxPages: Math.max(1, Math.min(5000, getPref("maxPages"))),
+			maxFileBytes: Math.max(1, getPref("maxFileMB")) * 1048576,
+			concurrency: Math.max(1, getPref("renderConcurrency")),
 			signal,
 		};
-		const docTimeoutMs = Math.max(1, getPref<number>("docTimeoutMinutes", 30)) * 60000;
+		const docTimeoutMs = Math.max(1, getPref("docTimeoutMinutes")) * 60000;
 		let batch: PageDoc[] = [];
 		let batchBytes = 0;
 		const inflight = new Set<Promise<unknown>>();
@@ -740,7 +708,6 @@ export class Indexer {
 				file_hash: hash,
 				page_image_b64: p.jpegB64,
 			};
-			// Page 1 is the commit record: publish it only after every other page succeeded.
 			if (p.page === 1) { firstPage = doc; return; }
 			batch.push(doc);
 			batchBytes += p.jpegB64.length;
@@ -796,7 +763,6 @@ export class Indexer {
 		lastProgress = Date.now();
 		stallLimit = UPLOAD_STALL_TIMEOUT_MS;
 		this.setProgressText(`${title} — uploading ${result.rendered - uploaded} page(s)…`);
-		// Rendering is done; the queue may start the next attachment while these uploads drain.
 		const completion = (async () => {
 			let drained = false;
 			try {
@@ -873,15 +839,14 @@ export class Indexer {
 		await this.flushPendingDeletes();
 	}
 
-	/** Resolves once the queue is drained (used by tests). */
 	async whenIdle(timeoutMs = 600000) {
 		const deadline = Date.now() + timeoutMs;
-		while ((this.running || this.queue.length || this.pending.size || this.deleting) && Date.now() < deadline) await delay(200);
+		while (this.running || this.queue.length || this.pending.size || this.deleting) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw new Error("Timed out waiting for the indexing queue to drain");
+			await delay(Math.min(200, remaining));
+		}
 	}
-
-	// ----------------------------------------------------------------------
-	// Progress window
-	// ----------------------------------------------------------------------
 
 	private ensureProgress() {
 		if (this.progress) return;

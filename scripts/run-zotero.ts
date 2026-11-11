@@ -1,14 +1,8 @@
-// Launches Zotero with a throwaway profile that loads the plugin from build/addon.
-//
-//   npx tsx scripts/run-zotero.ts [--headless] [--fake] [--selftest out.json] [--data DIR] [--profile DIR]
-//
-// Set ZOTERO_BIN to your Zotero executable (Linux: .../zotero, macOS: Zotero.app/Contents/MacOS/zotero).
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, chmodSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, chmodSync, createWriteStream } from "node:fs";
+import { join, relative, isAbsolute, resolve } from "node:path";
+import { root, addonID, addonDir } from "./project";
 import { spawn } from "node:child_process";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 if (args.some((arg) => arg === "--apikey" || arg.startsWith("--apikey="))) {
 	console.error("--apikey is no longer supported; use TOPK_API_KEY in the environment instead.");
@@ -28,7 +22,8 @@ const data = resolve(opt("--data", join(devDir, "data")));
 const fresh = flag("--fresh");
 // user.js below disables add-on signing and enables the remote debugger: never write that into a real profile.
 for (const [name, dir] of [["--profile", profile], ["--data", data]]) {
-	if (!dir.startsWith(devDir + "/") && !flag("--allow-external-dirs")) {
+	const inside = relative(devDir, dir);
+	if ((!inside || inside === ".." || inside.startsWith("../") || inside.startsWith("..\\") || isAbsolute(inside)) && !flag("--allow-external-dirs")) {
 		console.error(`${name} ${dir} is outside the dev directory ${devDir}; pass --allow-external-dirs if you really mean it`);
 		process.exit(2);
 	}
@@ -41,17 +36,15 @@ mkdirSync(join(profile, "extensions"), { recursive: true, mode: 0o700 });
 mkdirSync(data, { recursive: true, mode: 0o700 });
 chmodSync(profile, 0o700);
 
-const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const extDir = join(profile, "extensions");
-rmSync(join(extDir, pkg.config.addonID), { force: true });
-rmSync(join(extDir, pkg.config.addonID + ".xpi"), { force: true });
+rmSync(join(extDir, addonID), { force: true });
+rmSync(join(extDir, addonID + ".xpi"), { force: true });
 if (opt("--xpi")) {
-	// Install the packaged xpi (exercises the jar: code paths).
-	cpSync(resolve(opt("--xpi")), join(extDir, pkg.config.addonID + ".xpi"));
+	cpSync(resolve(opt("--xpi")), join(extDir, addonID + ".xpi"));
 }
 else {
 	// Proxy file: tells the add-on manager to load the plugin from the build directory.
-	writeFileSync(join(extDir, pkg.config.addonID), join(root, "build", "addon") + "/");
+	writeFileSync(join(extDir, addonID), addonDir + "/");
 }
 // Force the add-on manager to rescan.
 const prefsFile = join(profile, "prefs.js");
@@ -102,15 +95,19 @@ if (flag("--jsconsole")) zArgs.push("-jsconsole");
 console.log(`launching ${zoteroBin} ${zArgs.join(" ")}`);
 const child = spawn(zoteroBin, zArgs, { env, stdio: ["ignore", "pipe", "pipe"] });
 const logPath = opt("--log", join(devDir, "zotero.log"));
-const logStream = (await import("node:fs")).createWriteStream(logPath);
+const logStream = createWriteStream(logPath);
 for (const s of [child.stdout, child.stderr]) {
 	s.on("data", (d) => {
 		logStream.write(d);
 		if (flag("--verbose")) process.stdout.write(d);
 	});
 }
-child.on("exit", (code) => {
-	logStream.end();
-	console.log(`zotero exited with ${code}; log at ${logPath}`);
-	process.exit(code ?? 0);
+child.on("error", (error) => {
+	console.error(`could not launch Zotero: ${error.message}`);
+});
+child.on("close", (code, signal) => {
+	logStream.end(() => {
+		console.log(`zotero exited with ${signal || code}; log at ${logPath}`);
+		process.exitCode = code ?? 1;
+	});
 });

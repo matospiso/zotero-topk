@@ -7,6 +7,7 @@ import { Menus } from "./menus";
 import { PLUGIN_ID, getPref } from "./prefs";
 import { log, logError, errorMessage } from "./log";
 import { runSelfTest } from "./selftest";
+import { selectedLibraryIDs } from "./library";
 
 export class TopKAddon {
 	public readonly bridge: Bridge;
@@ -17,7 +18,6 @@ export class TopKAddon {
 	public readonly menus: Menus;
 	public readonly version: string;
 	public readonly rootURI: string;
-	public initialized = false;
 	private prefPaneID: string | null = null;
 
 	constructor(rootURI: string, version: string) {
@@ -59,11 +59,9 @@ export class TopKAddon {
 		});
 		for (const win of Zotero.getMainWindows()) this.onMainWindowLoad(win);
 		await this.indexer.start();
-		this.initialized = true;
 
 		if (__DEV__) {
-			// Development builds only: the self-test imports fixtures from a pref-supplied path and quits Zotero.
-			const selftest = getPref<string>("selftest", "");
+			const selftest = getPref("selftest");
 			if (selftest) {
 				runSelfTest(this, selftest).catch((e) => logError("selftest", e));
 			}
@@ -102,14 +100,10 @@ export class TopKAddon {
 		this.bridge.killSync();
 	}
 
-	// ----------------------------------------------------------------------
-	// Actions (also used by the preferences pane)
-	// ----------------------------------------------------------------------
-
 	async testConnection() {
 		const result = await this.bridge.testConnection();
 		void this.indexer.retryPendingDeletes().catch((e) => logError("deletions after connection", e));
-		if (getPref<boolean>("autoIndex", true)) {
+		if (getPref("autoIndex")) {
 			void this.indexer.indexAllLibraries({ force: false }).catch((e) => logError("sync after connection", e));
 		}
 		return result;
@@ -134,11 +128,7 @@ export class TopKAddon {
 
 	private rebuildSelectedLibrary(win: any) {
 		win = win || Zotero.getMainWindow();
-		let libraryIDs: number[] = [];
-		try { libraryIDs = win.ZoteroPane.getSelectedLibraryIDs(); } catch (e) {}
-		if (!libraryIDs.length) {
-			try { libraryIDs = [win.ZoteroPane.getSelectedLibraryID()]; } catch (e) {}
-		}
+		const libraryIDs = selectedLibraryIDs(win.ZoteroPane);
 		if (!libraryIDs.length) return;
 		const names = libraryIDs.map((id) => Zotero.Libraries.get(id)?.name || id).join(", ");
 		if (!Services.prompt.confirm(win, "TopK Semantic Search",

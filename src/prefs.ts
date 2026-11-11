@@ -1,13 +1,11 @@
-export const PREF_PREFIX = "extensions.zotero-topk.";
-export const PLUGIN_ID = "zotero-topk@topk.io";
+import { DEFAULT_PREFS, PREF_PREFIX, type PreferenceKey, type Preferences } from "../shared/preferences";
+export { PREF_PREFIX, PLUGIN_ID } from "../shared/preferences";
 
-export function getPref<T>(key: string, fallback?: T): T {
-	const v = Zotero.Prefs.get(PREF_PREFIX + key, true);
-	return (v === undefined || v === null ? fallback : v) as T;
+export function getPref<K extends PreferenceKey>(key: K): Preferences[K] {
+	const value = Zotero.Prefs.get(PREF_PREFIX + key, true);
+	return value === undefined || value === null ? DEFAULT_PREFS[key] : value;
 }
 
-export function setPref(key: string, value: string | number | boolean) {
-	Zotero.Prefs.set(PREF_PREFIX + key, value, true);
+export function getPrefs<K extends PreferenceKey>(keys: readonly K[]): Pick<Preferences, K> {
+	return Object.fromEntries(keys.map((key) => [key, getPref(key)])) as Pick<Preferences, K>;
 }
-
-export const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
