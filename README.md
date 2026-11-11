@@ -22,12 +22,12 @@ search sends your text to TopK and gets back the best matching pages.
   button.
 - **Tools ▸ TopK Semantic Search** menu and item context‑menu entries to
   index / re‑index / remove items, and a settings pane (API key, region,
-  collection, Node.js path, indexing options, *Test connection*).
+  collection, Bun path, indexing options, *Test connection*).
 
 ## Architecture
 
 ```
-Zotero (Gecko)                                   Node.js helper (bridge/server.ts)
+Zotero (Gecko)                                   Bun helper (bridge/server.ts)
 ┌──────────────────────────────┐   localhost     ┌──────────────────────────────┐
 │ indexer ─► renderer          │  HTTP + token   │  topk-js (official JS SDK)   │
 │   PDF  → Zotero's pdf.js     │ ──────────────► │  collection "zotero-pages"   │
@@ -36,14 +36,13 @@ Zotero (Gecko)                                   Node.js helper (bridge/server.t
 └──────────────────────────────┘                 └──────────────────────────────┘
 ```
 
-TopK's JavaScript SDK is a native Node module, which Zotero's Gecko runtime
-cannot load. The plugin therefore starts a tiny helper process with Node.js
+TopK's JavaScript SDK is a native Node-API module, which Zotero's Gecko runtime
+cannot load. The plugin therefore starts a tiny helper process with Bun
 (auto‑detected, or set in settings), installs the pinned `topk-js` version
-from the shipped lockfile (`npm ci --ignore-scripts`) into
+from the shipped lockfile (`bun install --frozen-lockfile --production --ignore-scripts`) into
 `<Zotero data dir>/topk-bridge/` on first run, and talks to it over
 `127.0.0.1` with a per‑session random bearer token. All TopK reads and writes
-go through the SDK in that process. The build compiles the helper and Zotero
-entry points from TypeScript to JavaScript; end users do not need TypeScript or tsx.
+go through the SDK in that process.
 
 Page rendering happens in a content‑privileged `<browser>` loaded from
 `resource://zotero-topk/` with the plugin's own bundled copy of pdf.js, so a
@@ -88,9 +87,13 @@ moves it from its local identity to its synced user identity.
 ## Requirements
 
 - Zotero 7 or later (developed and tested with Zotero 10.0.6).
-- Node.js 18+ on the machine (https://nodejs.org). npm is used once to
+- Bun 1.4.4+ on the machine (https://bun.sh). Bun is used once to
   install the SDK into the helper directory.
 - A TopK account and API key (https://console.topk.io).
+
+Existing installs must install Bun when upgrading from the Node helper and set
+`bunPath` if auto-detection fails. The previous `nodePath` preference is ignored;
+API keys, destinations, and indexed state are preserved.
 
 ## Install
 
@@ -104,31 +107,35 @@ moves it from its local identity to its synced user identity.
 
 ## Development
 
-Use Node.js 22 and the `zip`/`unzip` tools for development. TypeScript scripts run
-through `tsx`; the packaged helper remains compatible with Node.js 18+.
+Install Bun 1.4.4 and the `zip`/`unzip` command-line tools for packaging tests.
 
 Each pull request runs the regression suite, type checks, and builds an installable
 XPI. Open its **Test and build XPI** check and use the download link in the run
 summary (GitHub sign-in required; builds are retained for 30 days).
 
 ```sh
-npm ci
-npm ci --prefix bridge --ignore-scripts
-npm test                 # deterministic failure/race regression tests
-npm run typecheck
-npm run build            # → build/addon + build/zotero-topk-<version>.xpi
+bun install --frozen-lockfile --ignore-scripts
+bun install --cwd bridge --frozen-lockfile --ignore-scripts
+bun test                 # deterministic failure/race regression tests
+bun run typecheck
+bun run build            # → build/addon + build/zotero-topk-<version>.xpi
 export ZOTERO_BIN=/path/to/zotero
-npm start                # dev build + launch Zotero with a throwaway profile (.zotero-dev/)
-npx tsx scripts/run-zotero.ts --headless --fake   # in-memory fake backend, no API key needed
-npm run e2e              # headless end-to-end test with the fake backend
-npx tsx scripts/e2e.ts --real --collection zotero-e2e              # against TopK (key from .env or TOPK_API_KEY)
-npx tsx scripts/e2e.ts --real --region strawberry --host topk.dev    # against a dev deployment
-npx tsx scripts/release.ts                                           # release xpi + update.json with sha256
+bun run start            # dev build + launch Zotero with a throwaway profile (.zotero-dev/)
+bun scripts/run-zotero.ts --headless --fake   # in-memory fake backend, no API key needed
+bun run e2e              # headless end-to-end test with the fake backend
+bun scripts/e2e.ts --real --collection zotero-e2e              # against TopK (key from .env or TOPK_API_KEY)
+bun scripts/e2e.ts --real --region strawberry --host topk.dev    # against a dev deployment
+bun scripts/release.ts                                           # release xpi + update.json with sha256
 ```
 
 Keep the API key in `.env` (git‑ignored, `chmod 600`) or in the environment;
 the scripts reject `--apikey` so keys are never accepted on a command line.
-The fake backend and self-test entry point are available only in development builds.
+The plugin's fake-backend preference and self-test entry point are enabled only
+in development builds. Bun runs the helper's TypeScript directly; Zotero loads
+JavaScript generated from the bootstrap, preferences, renderer, and plugin source.
+The helper and scripts use strict TypeScript checks, and `bun run typecheck` also
+checks the plugin, browser scripts, shared contracts, and test harness.
+`node:` imports use Bun's compatible standard library; Node/npm are not required.
 
 `scripts/e2e.ts` imports a PDF and an HTML snapshot, waits for indexing,
 searches through the real quick‑search code path, checks the item pane data,
@@ -143,9 +150,9 @@ hit of each as `q<i>.jpg` in the e2e output directory.
 
 ```
 addon/      TypeScript bootstrap/preferences/renderer, manifest, icons, locale
-src/        plugin code (TypeScript, bundled by esbuild into addon/content/zotero-topk.js)
-bridge/     Node.js helper that wraps topk-js (copied to the Zotero data dir at runtime)
-shared/     typed page and request contracts
+src/        plugin code (TypeScript, bundled by Bun into addon/content/zotero-topk.js)
+bridge/     Bun helper that wraps topk-js (copied to the Zotero data dir at runtime)
+shared/     typed request and page contracts used by the plugin and helper
 scripts/    TypeScript build, dev launcher, headless e2e
 test/       fixtures and probe queries
 ```
@@ -154,7 +161,7 @@ test/       fixtures and probe queries
 
 - Enable *Debug* in the plugin settings, then Help ▸ Debug Output Logging ▸
   View Output. All plugin messages are prefixed with `[TopK]`.
-- *Test connection* fails with "Node.js not found": install Node 18+ or set
+- *Test connection* fails with "Bun was not found": install Bun 1.4.4+ or set
   the path in settings.
 - Indexing stalls: a watchdog cancels a document after 4 minutes without
   progress and retries it; the debug log shows which document and page.
@@ -167,7 +174,7 @@ test/       fixtures and probe queries
 | `region` | `aws-us-east-1-elastica` | TopK region |
 | `host` | – (topk.io) | advanced: API host; the endpoint is `https://<region>.api.<host>` |
 | `collection` | `zotero-pages` | collection name (created if missing) |
-| `nodePath` | auto | Node.js executable |
+| `bunPath` | auto | Bun executable |
 | `autoIndex` | `true` | index new/changed attachments automatically |
 | `indexSnapshots` | `true` | include HTML snapshots (printed to A4 pages) |
 | `maxPages` | `500` | pages per document |
@@ -181,7 +188,7 @@ test/       fixtures and probe queries
 
 ## Releasing
 
-`npx tsx scripts/release.ts` builds the xpi and writes `update.json` with the
+`bun scripts/release.ts` builds the xpi and writes `update.json` with the
 asset URL of the matching GitHub release and the xpi's `sha256` as
 `update_hash`. Commit `update.json`, tag `v<version>`, create the release and
 upload the xpi; Zotero verifies the hash before installing an update. Keep
