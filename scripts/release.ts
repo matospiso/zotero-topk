@@ -1,7 +1,7 @@
 // Builds the release xpi and writes update.json with the xpi's sha256, so Zotero's updater
 // verifies the bytes it downloads (update_hash) against what this reviewed commit published.
 //
-//   node scripts/release.mjs            # build/zotero-topk-<version>.xpi + update.json
+//   npx tsx scripts/release.ts            # build/zotero-topk-<version>.xpi + update.json
 //
 // Release flow: bump "version" in package.json, run this script, commit update.json, tag
 // v<version>, create a GitHub release for that tag and upload the xpi as the asset named below.
@@ -17,7 +17,7 @@ const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const manifest = JSON.parse(readFileSync(join(root, "addon", "manifest.json"), "utf8"));
 const repo = process.env.TOPK_PLUGIN_REPO || "topk-io/zotero-topk";
 
-execFileSync("node", [join(root, "scripts", "build.mjs")], { stdio: "inherit" });
+execFileSync(process.execPath, ["--import", "tsx", join(root, "scripts", "build.ts")], { stdio: "inherit" });
 const xpiName = `zotero-topk-${pkg.version}.xpi`;
 const xpi = readFileSync(join(root, "build", xpiName));
 const sha256 = createHash("sha256").update(xpi).digest("hex");

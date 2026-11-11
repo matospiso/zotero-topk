@@ -9,3 +9,7 @@ declare const rootURI: string;
 declare const pluginID: string;
 declare const pluginVersion: string;
 declare const __DEV__: boolean;
+
+declare const APP_SHUTDOWN: number;
+declare const ADDON_UNINSTALL: number;
+declare function pref(name: string, value: string | number | boolean): void;

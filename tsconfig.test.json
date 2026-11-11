@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.tools.json",
+  "compilerOptions": {
+    "noImplicitAny": false
+  },
+  "include": [
+    "test",
+    "typings",
+    "shared"
+  ],
+  "exclude": []
+}

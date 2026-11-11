@@ -1,7 +1,7 @@
 // Headless end-to-end test: builds the plugin, runs Zotero with the fake bridge
 // backend (or the real one with --real) and checks the self-test report.
 //
-//   ZOTERO_BIN=/path/to/zotero node scripts/e2e.mjs [--real [--collection NAME] [--region R] [--host topk.dev]] [--keep] [--no-papers]
+//   ZOTERO_BIN=/path/to/zotero npx tsx scripts/e2e.ts [--real [--collection NAME] [--region R] [--host topk.dev]] [--keep] [--no-papers]
 //   The API key comes from the TOPK_API_KEY environment variable or .env (never a command-line argument).
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, cpSync, readFileSync, rmSync, existsSync, readdirSync } from "node:fs";
@@ -21,12 +21,12 @@ if (args.some((arg) => arg === "--apikey" || arg.startsWith("--apikey="))) {
 	console.error("--apikey is no longer supported; use TOPK_API_KEY in the environment instead.");
 	process.exit(2);
 }
-const flag = (n) => args.includes(n);
-const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
+const flag = (n: string) => args.includes(n);
+const opt = (n: string) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
 
 const useXpi = flag("--xpi");
 // The e2e always uses a dev build (selftest hooks are compiled out of release builds); --xpi additionally zips it.
-execFileSync("node", [join(root, "scripts", "build.mjs"), "--dev", ...(useXpi ? ["--xpi"] : [])], { stdio: "inherit" });
+execFileSync(process.execPath, ["--import", "tsx", join(root, "scripts", "build.ts"), "--dev", ...(useXpi ? ["--xpi"] : [])], { stdio: "inherit" });
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
 const devDir = join(root, ".zotero-dev", "e2e");
@@ -40,7 +40,7 @@ if (!flag("--no-papers") && existsSync(join(root, "test", "papers"))) {
 	if (existsSync(join(root, "test", "queries.json"))) cpSync(join(root, "test", "queries.json"), join(devDir, "queries.json"));
 }
 
-const runArgs = [join(root, "scripts", "run-zotero.mjs"), "--headless", "--fresh", "--dev-dir", devDir, "--selftest", report,
+const runArgs = ["--import", "tsx", join(root, "scripts", "run-zotero.ts"), "--headless", "--fresh", "--dev-dir", devDir, "--selftest", report,
 	"--log", join(devDir, "zotero.log")];
 const childEnv = { ...process.env };
 delete childEnv.TOPK_API_KEY;
@@ -52,7 +52,7 @@ if (flag("--real")) {
 	}
 	// The key travels to the child through its environment, never through argv (visible in the process list).
 	childEnv.TOPK_API_KEY = apiKey;
-	if (opt("--collection")) runArgs.push("--collection", opt("--collection"));
+	if (opt("--collection")) runArgs.push("--collection", opt("--collection")!);
 	const region = opt("--region") || process.env.TOPK_REGION;
 	const host = opt("--host") || process.env.TOPK_HOST;
 	if (region) runArgs.push("--region", region);
@@ -61,9 +61,9 @@ if (flag("--real")) {
 else {
 	runArgs.push("--fake");
 }
-if (opt("--node")) runArgs.push("--node", opt("--node"));
+runArgs.push("--node", opt("--node") || process.execPath);
 if (useXpi) runArgs.push("--xpi", join(root, "build", `zotero-topk-${pkg.version}.xpi`));
-const res = spawnSync("node", runArgs, { stdio: "inherit", timeout: 15 * 60 * 1000, env: childEnv });
+const res = spawnSync(process.execPath, runArgs, { stdio: "inherit", timeout: 15 * 60 * 1000, env: childEnv });
 if (!existsSync(report)) {
 	console.error("no report written; see", join(devDir, "zotero.log"));
 	process.exit(1);

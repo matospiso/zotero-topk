@@ -3,10 +3,14 @@
 // (src/renderer.ts) reads the file, hands the bytes in, and receives page images back through
 // an exported callback. pdf.js is bundled with the plugin (content/pdfjs/) so everything the
 // parser fetches is same-origin.
-import * as pdfjsLib from "./pdfjs/pdf.mjs";
+import type { RenderedPage, RenderOptions } from "../../src/renderer";
+type ContentRenderOptions = Omit<RenderOptions, "signal"> & { isCancelled?: () => boolean };
+declare global { interface Window { TopKRenderer: { version: number; renderPdf: typeof renderPdf } } }
+
+import * as pdfjsLib from "pdfjs-dist";
 
 const PDF_BASE = new URL("./pdfjs/", import.meta.url).href;
-let workerPort = null;
+let workerPort: Worker | null = null;
 
 function ensureWorker() {
 	if (!workerPort) {
@@ -17,12 +21,12 @@ function ensureWorker() {
 	}
 }
 
-function toBlob(canvas, quality) {
-	return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+function toBlob(canvas: HTMLCanvasElement, quality: number) {
+	return new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
 }
 
-function blobToBase64(blob) {
-	return new Promise((resolve, reject) => {
+function blobToBase64(blob: Blob) {
+	return new Promise<string>((resolve, reject) => {
 		const reader = new FileReader();
 		reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
 		reader.onerror = () => reject(reader.error);
@@ -34,7 +38,7 @@ function blobToBase64(blob) {
  * Encode a canvas as JPEG, lowering quality and then resolution until the
  * result fits under `maxBytes` (TopK caps images at 512 KB).
  */
-async function encodeJpeg(canvas, quality, maxBytes) {
+async function encodeJpeg(canvas: HTMLCanvasElement, quality: number, maxBytes: number) {
 	let current = canvas;
 	let q = quality;
 	for (let attempt = 0; attempt < 12; attempt++) {
@@ -50,7 +54,7 @@ async function encodeJpeg(canvas, quality, maxBytes) {
 			const next = document.createElement("canvas");
 			next.width = Math.max(64, Math.round(current.width * 0.85));
 			next.height = Math.max(64, Math.round(current.height * 0.85));
-			next.getContext("2d").drawImage(current, 0, 0, next.width, next.height);
+			next.getContext("2d")!.drawImage(current, 0, 0, next.width, next.height);
 			current = next;
 			q = quality;
 		}
@@ -63,7 +67,7 @@ async function encodeJpeg(canvas, quality, maxBytes) {
  * @param opts     { maxEdge, quality, maxBytes, maxPages, concurrency, isCancelled() }
  * @param onPage   callback(pageInfo) -> Promise, exported from the privileged side
  */
-async function renderPdf(data, opts, onPage) {
+async function renderPdf(data: Uint8Array, opts: ContentRenderOptions, onPage: (page: RenderedPage) => Promise<void>) {
 	ensureWorker();
 	const maxEdge = Math.max(256, Math.min(4096, opts.maxEdge || 1536));
 	const quality = Math.max(0.3, Math.min(1, (opts.quality || 85) / 100));
@@ -85,14 +89,14 @@ async function renderPdf(data, opts, onPage) {
 	const count = Math.min(total, maxPages);
 	let next = 1;
 	let rendered = 0;
-	let failure = null;
+	let failure: unknown = null;
 	const cancelled = () => failure || isCancelled();
 
 	// Each lane owns one canvas and pulls page numbers from a shared counter, so
 	// worker-side parsing, main-thread painting and JPEG encoding overlap across pages.
 	async function lane() {
 		const canvas = document.createElement("canvas");
-		const ctx = canvas.getContext("2d", { alpha: false });
+		const ctx = canvas.getContext("2d", { alpha: false })!;
 		try {
 			while (!cancelled()) {
 				const i = next++;
@@ -108,7 +112,7 @@ async function renderPdf(data, opts, onPage) {
 					ctx.fillRect(0, 0, canvas.width, canvas.height);
 					// intent "print": full quality and no requestAnimationFrame pacing
 					// (rAF is throttled in hidden frames, which made rendering crawl).
-					await page.render({ canvasContext: ctx, viewport, intent: "print", background: "#ffffff" }).promise;
+					await page.render({ canvas, canvasContext: ctx, viewport, intent: "print", background: "#ffffff" }).promise;
 					const jpeg = await encodeJpeg(canvas, quality, maxBytes);
 					const b64 = await blobToBase64(jpeg.blob);
 					if (cancelled()) return;

@@ -10,5 +10,6 @@
   },
   "dependencies": {
     "topk-js": "0.16.1"
-  }
+  },
+  "type": "module"
 }

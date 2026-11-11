@@ -8,7 +8,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const out = join(here, "..", "addon", "content", "icons");
 mkdirSync(out, { recursive: true });
 
-function crc32(buf) {
+function crc32(buf: Uint8Array) {
 	let c, crc = 0xffffffff;
 	for (let n = 0; n < buf.length; n++) {
 		c = (crc ^ buf[n]) & 0xff;
@@ -17,13 +17,13 @@ function crc32(buf) {
 	}
 	return (crc ^ 0xffffffff) >>> 0;
 }
-function chunk(type, data) {
+function chunk(type: string, data: Uint8Array) {
 	const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
 	const td = Buffer.concat([Buffer.from(type), data]);
 	const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
 	return Buffer.concat([len, td, crc]);
 }
-function png(size, pixel) {
+function png(size: number, pixel: (x: number, y: number) => number[]) {
 	const raw = Buffer.alloc((size * 4 + 1) * size);
 	for (let y = 0; y < size; y++) {
 		raw[y * (size * 4 + 1)] = 0;
@@ -41,7 +41,7 @@ function png(size, pixel) {
 	]);
 }
 // Rounded dark square with a white magnifier ring and handle.
-function draw(size) {
+function draw(size: number) {
 	const s = size;
 	return png(s, (x, y) => {
 		const r = s * 0.22;

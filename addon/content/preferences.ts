@@ -4,9 +4,9 @@
 	"use strict";
 
 	const PREF = "extensions.zotero-topk.";
-	const $ = (id) => document.getElementById(id);
+	const $ = (id: string) => document.getElementById(id) as HTMLInputElement | null;
 
-	function setStatus(id, text, cls) {
+	function setStatus(id: string, text: string, cls?: string) {
 		const el = $(id);
 		if (!el) return;
 		el.textContent = text;
@@ -15,7 +15,7 @@
 	}
 
 	async function testConnection() {
-		const btn = $("zotero-topk-test");
+		const btn = $("zotero-topk-test")!;
 		btn.disabled = true;
 		setStatus("zotero-topk-status", "Starting helper and connecting…");
 		try {
@@ -27,7 +27,7 @@
 			setStatus("zotero-topk-status", parts.join(" "), "ok");
 		}
 		catch (e) {
-			setStatus("zotero-topk-status", String(e && e.message || e), "error");
+			setStatus("zotero-topk-status", String(e instanceof Error ? e.message : e), "error");
 		}
 		finally {
 			btn.disabled = false;
@@ -40,7 +40,7 @@
 		fp.init(window, "Select the Node.js executable", fp.modeOpen);
 		if ((await fp.show()) === fp.returnOK && fp.path) {
 			Zotero.Prefs.set(PREF + "nodePath", fp.path, true);
-			$("zotero-topk-node").value = fp.path;
+			$("zotero-topk-node")!.value = fp.path;
 		}
 	}
 
@@ -60,20 +60,20 @@
 			window.setTimeout(init, 50);
 			return;
 		}
-		$("zotero-topk-test").addEventListener("command", testConnection);
-		$("zotero-topk-node-browse").addEventListener("command", browseNode);
-		$("zotero-topk-index-now").addEventListener("command", () => {
+		$("zotero-topk-test")!.addEventListener("command", testConnection);
+		$("zotero-topk-node-browse")!.addEventListener("command", browseNode);
+		$("zotero-topk-index-now")!.addEventListener("command", () => {
 			Zotero.TopK.indexAllLibraries({ force: false });
 			refreshIndexStatus();
 		});
-		$("zotero-topk-rebuild").addEventListener("command", () => {
+		$("zotero-topk-rebuild")!.addEventListener("command", () => {
 			if (Services.prompt.confirm(window, "TopK Semantic Search",
 				"Re-render and re-upload every PDF and snapshot in all libraries? This can take a long time.")) {
 				Zotero.TopK.indexAllLibraries({ force: true });
 				refreshIndexStatus();
 			}
 		});
-		const maxPages = $("zotero-topk-maxpages");
+		const maxPages = $("zotero-topk-maxpages")!;
 		maxPages.value = Zotero.Prefs.get(PREF + "maxPages", true) || 500;
 		maxPages.addEventListener("change", () => {
 			const n = parseInt(maxPages.value, 10);
