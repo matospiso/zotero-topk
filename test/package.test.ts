@@ -1,8 +1,5 @@
-import { after as afterAll, before as beforeAll, test } from "node:test";
-import assert from "node:assert/strict";
-import { once } from "node:events";
-import { request as httpRequest } from "node:http";
-import { execFileSync, spawn } from "node:child_process";
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,8 +9,8 @@ import { version } from "../package.json";
 
 let extracted: string;
 beforeAll(() => {
-	execFileSync(process.execPath, ["--import", "tsx", "scripts/build.ts"], { stdio: "pipe" });
-	extracted = mkdtempSync(join(tmpdir(), "topk-node-package-"));
+	execFileSync(process.execPath, ["scripts/build.ts"], { stdio: "pipe" });
+	extracted = mkdtempSync(join(tmpdir(), "topk-bun-package-"));
 	execFileSync("unzip", ["-q", `build/zotero-topk-${version}.xpi`, "-d", extracted]);
 });
 afterAll(() => { if (extracted) rmSync(extracted, { recursive: true, force: true }); });
@@ -22,25 +19,25 @@ test("XPI exposes Zotero lifecycle callbacks and compiled default preferences", 
 	const context = vm.createContext({});
 	vm.runInContext(readFileSync(join(extracted, "bootstrap.js"), "utf8"), context);
 	for (const name of ["install", "uninstall", "startup", "shutdown", "onMainWindowLoad", "onMainWindowUnload"]) {
-		assert.equal(typeof context[name], "function");
+		expect(typeof context[name]).toBe("function");
 	}
 	const prefs = new Map<string, unknown>();
 	vm.runInNewContext(readFileSync(join(extracted, "prefs.js"), "utf8"), { pref: (key: string, value: unknown) => prefs.set(key, value) });
-	assert.equal(prefs.get("extensions.zotero-topk.nodePath"), "");
-	assert.equal(prefs.get("extensions.zotero-topk.uploadConcurrency"), 4);
-	assert.equal(prefs.has("extensions.zotero-topk.bunPath"), false);
+	expect(prefs.get("extensions.zotero-topk.bunPath")).toBe("");
+	expect(prefs.get("extensions.zotero-topk.uploadConcurrency")).toBe(4);
+	expect(prefs.has("extensions.zotero-topk.nodePath")).toBe(false);
 	const renderer = readFileSync(join(extracted, "content/renderer.js"), "utf8");
-	assert.ok(renderer.includes('"./pdfjs/pdf.mjs"'));
-	assert.ok(!renderer.includes('from "pdfjs-dist"'));
+	expect(renderer).toContain('"./pdfjs/pdf.mjs"');
+	expect(renderer).not.toContain('from "pdfjs-dist"');
 });
 
-test("the pinned native TopK SDK loads under Node without credentials or network", () => {
+test("the pinned native TopK SDK loads under Bun without credentials or network", () => {
 	const backend = new TopKBackend();
 	const sdk = backend._sdk();
 	const client = new sdk.Client({ apiKey: "never-provisioned-test-key", region: "aws-us-east-1-elastica" });
-	assert.ok(client.collection("compatibility-probe"));
-	assert.ok(sdk.data.image(readFileSync("addon/content/icons/topk-48.png")));
-	assert.ok(backend._schema().page_image);
+	expect(client.collection("compatibility-probe")).toBeDefined();
+	expect(sdk.data.image(readFileSync("addon/content/icons/topk-48.png"))).toBeDefined();
+	expect(backend._schema().page_image).toBeDefined();
 });
 
 test("production plugin bundle loads as a classic Gecko script and ignores the fake preference", async () => {
@@ -49,58 +46,54 @@ test("production plugin bundle loads as a classic Gecko script and ignores the f
 		Zotero: { Prefs: { get: (key: string) => key.endsWith("bridgeFake") ? true : "" } },
 	});
 	vm.runInContext(readFileSync(join(extracted, "content/zotero-topk.js"), "utf8"), context);
-	assert.equal(context.Zotero.TopK.version, version);
-	assert.equal(context.Zotero.TopK.rootURI, "resource://zotero-topk/");
+	expect(context.Zotero.TopK.version).toBe(version);
+	expect(context.Zotero.TopK.rootURI).toBe("resource://zotero-topk/");
 	context.Zotero.TopK.bridge.ensureRunning = async () => {};
-	await assert.rejects(context.Zotero.TopK.bridge.ensureReady(), /No TopK API key/);
+	await expect(context.Zotero.TopK.bridge.ensureReady()).rejects.toThrow("No TopK API key");
 });
 
-test("packaged Node helper serves authenticated requests and exits when its parent pipe closes", { timeout: 10000 }, async () => {
+test("packaged Bun helper serves authenticated requests and exits when its parent pipe closes", async () => {
 	const token = "test-session-token-".repeat(3);
-	const child = spawn(process.execPath, ["server.js"], {
-		cwd: join(extracted, "bridge"), env: { ...process.env, TOPK_BRIDGE_TOKEN: token, TOPK_BRIDGE_FAKE: "1" },
-		stdio: ["pipe", "pipe", "pipe"],
+	// Bun's automatic .env loading must not override the launcher's controlled environment.
+	writeFileSync(join(extracted, "bridge/.env"), "TOPK_BRIDGE_TOKEN=wrong\nTOPK_BRIDGE_FAKE=0\n");
+	const child = Bun.spawn([process.execPath, "--no-env-file", "server.ts"], {
+		cwd: join(extracted, "bridge"),
+		env: { PATH: process.env.PATH, TOPK_BRIDGE_TOKEN: token, TOPK_BRIDGE_FAKE: "1" },
+		stdin: "pipe", stdout: "pipe", stderr: "pipe",
 	});
-	const exited = once(child, "exit");
-	let stderr = ""; child.stderr.on("data", (chunk) => { stderr += chunk; });
 	try {
+		const reader = child.stdout.getReader();
 		let stdout = "";
-		for await (const chunk of child.stdout) {
-			stdout += chunk;
-			if (stdout.includes("\n")) break;
+		while (!stdout.includes("\n")) {
+			const { value, done } = await reader.read();
+			if (done) throw new Error(`Helper exited before READY: ${await new Response(child.stderr).text()}`);
+			stdout += new TextDecoder().decode(value);
 		}
-		const match = stdout.match(/TOPK_BRIDGE_READY (.+)\n/);
-		assert.ok(match, `Helper exited before READY: ${stderr}`);
-		const ready = JSON.parse(match[1]);
-		assert.equal(ready.fake, true);
+		reader.releaseLock();
+		const ready = JSON.parse(stdout.match(/TOPK_BRIDGE_READY (.+)\n/)![1]);
+		expect(ready.fake).toBe(true);
 		const base = `http://127.0.0.1:${ready.port}`;
 		const request = (route: string, body?: unknown, headers = {}) => fetch(base + route, {
 			method: body === undefined ? "GET" : "POST",
 			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...headers },
 			body: body === undefined ? undefined : JSON.stringify(body),
 		});
-		assert.equal((await fetch(base + "/health")).status, 401);
-		const foreignHostStatus = await new Promise<number | undefined>((resolve, reject) => {
-			const req = httpRequest(base + "/health", { headers: { Host: "foreign.example", Authorization: `Bearer ${token}` } }, (res) => {
-				res.resume(); resolve(res.statusCode);
-			});
-			req.on("error", reject); req.end();
-		});
-		assert.equal(foreignHostStatus, 403);
-		assert.equal((await request("/upsert", [])).status, 400);
-		assert.equal((await request("/configure", { apiKey: "fake", region: "test", collection: "pages" })).status, 200);
+		expect((await fetch(base + "/health")).status).toBe(401);
+		expect((await request("/health", undefined, { Host: "foreign.example" })).status).toBe(403);
+		expect((await request("/upsert", [])).status).toBe(400);
+		expect((await request("/configure", { apiKey: "fake", region: "test", collection: "pages" })).status).toBe(200);
 		const doc = { _id: "user:17/ABCDEFGH/1", library_key: "user:17", attachment_key: "ABCDEFGH",
 			page: 1, page_count: 1, indexed_pages: 1, page_image_b64: "aW1hZ2U=" };
-		assert.equal((await request("/upsert", { docs: [doc] })).status, 200);
+		expect((await request("/upsert", { docs: [doc] })).status).toBe(200);
 		const manifest = await (await request("/manifest", { libraryKey: "user:17" })).json();
-		assert.equal(manifest.rows.length, 1);
-		assert.equal((await request("/delete", { libraryKey: "user:17", attachmentKeys: ["ABCDEFGH"] })).status, 200);
+		expect(manifest.rows).toHaveLength(1);
+		expect((await request("/delete", { libraryKey: "user:17", attachmentKeys: ["ABCDEFGH"] })).status).toBe(200);
 		const removed = await (await request("/attachment-status", { libraryKey: "user:17", attachmentKey: "ABCDEFGH" })).json();
-		assert.equal(removed.exists, false);
+		expect(removed.exists).toBe(false);
 		child.stdin.end();
-		assert.equal((await exited)[0], 0);
+		expect(await child.exited).toBe(0);
 	} finally {
 		child.kill();
-		await exited;
+		await child.exited;
 	}
-});
+}, 10000);

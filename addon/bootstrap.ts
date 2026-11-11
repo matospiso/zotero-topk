@@ -5,7 +5,7 @@ var chromeHandle: { destruct(): void } | null = null;
 interface AddonData { id: string; version: string; rootURI: string }
 const RESOURCE_HOST = "zotero-topk";
 const PREF_KEYS = [
-	"apiKey", "region", "host", "collection", "nodePath", "autoIndex", "indexSnapshots", "maxPages", "maxEdge",
+	"apiKey", "region", "host", "collection", "nodePath", "bunPath", "autoIndex", "indexSnapshots", "maxPages", "maxEdge",
 	"jpegQuality", "resultLimit", "renderConcurrency", "uploadBatch", "uploadConcurrency", "maxFileMB", "docTimeoutMinutes", "debug",
 	"bridgeFake", "selftest",
 ];

@@ -9,18 +9,20 @@
     "addonRef": "zotero-topk"
   },
   "scripts": {
-    "build": "tsx scripts/build.ts",
-    "dev": "tsx scripts/build.ts --dev",
-    "test": "node --import tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tools.json && tsc --noEmit -p tsconfig.test.json",
-    "start": "tsx scripts/build.ts --dev && tsx scripts/run-zotero.ts",
-    "e2e": "tsx scripts/e2e.ts"
+    "build": "bun scripts/build.ts",
+    "dev": "bun scripts/build.ts --dev",
+    "test": "bun test",
+    "typecheck": "bun node_modules/typescript/bin/tsc --noEmit && bun node_modules/typescript/bin/tsc --noEmit -p tsconfig.tools.json && bun node_modules/typescript/bin/tsc --noEmit -p tsconfig.test.json",
+    "start": "bun scripts/build.ts --dev && bun scripts/run-zotero.ts",
+    "e2e": "bun scripts/e2e.ts"
   },
   "devDependencies": {
     "pdfjs-dist": "^5.7.284",
     "typescript": "^5.9.0",
-    "esbuild": "^0.25.0",
-    "tsx": "^4.20.0",
-    "@types/node": "^22.0.0"
+    "@types/bun": "1.4.4"
+  },
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "bun": ">=1.4.4"
   }
 }

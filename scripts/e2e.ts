@@ -1,7 +1,7 @@
 // Headless end-to-end test: builds the plugin, runs Zotero with the fake bridge
 // backend (or the real one with --real) and checks the self-test report.
 //
-//   ZOTERO_BIN=/path/to/zotero npx tsx scripts/e2e.ts [--real [--collection NAME] [--region R] [--host topk.dev]] [--keep] [--no-papers]
+//   ZOTERO_BIN=/path/to/zotero bun scripts/e2e.ts [--real [--collection NAME] [--region R] [--host topk.dev]] [--keep] [--no-papers]
 //   The API key comes from the TOPK_API_KEY environment variable or .env (never a command-line argument).
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, cpSync, readFileSync, rmSync, existsSync, readdirSync } from "node:fs";
@@ -26,7 +26,7 @@ const opt = (n: string) => { const i = args.indexOf(n); return i >= 0 ? args[i +
 
 const useXpi = flag("--xpi");
 // The e2e always uses a dev build (selftest hooks are compiled out of release builds); --xpi additionally zips it.
-execFileSync(process.execPath, ["--import", "tsx", join(root, "scripts", "build.ts"), "--dev", ...(useXpi ? ["--xpi"] : [])], { stdio: "inherit" });
+execFileSync(process.execPath, [join(root, "scripts", "build.ts"), "--dev", ...(useXpi ? ["--xpi"] : [])], { stdio: "inherit" });
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
 const devDir = join(root, ".zotero-dev", "e2e");
@@ -40,7 +40,7 @@ if (!flag("--no-papers") && existsSync(join(root, "test", "papers"))) {
 	if (existsSync(join(root, "test", "queries.json"))) cpSync(join(root, "test", "queries.json"), join(devDir, "queries.json"));
 }
 
-const runArgs = ["--import", "tsx", join(root, "scripts", "run-zotero.ts"), "--headless", "--fresh", "--dev-dir", devDir, "--selftest", report,
+const runArgs = ["--no-env-file", join(root, "scripts", "run-zotero.ts"), "--headless", "--fresh", "--dev-dir", devDir, "--selftest", report,
 	"--log", join(devDir, "zotero.log")];
 const childEnv = { ...process.env };
 delete childEnv.TOPK_API_KEY;
@@ -61,7 +61,7 @@ if (flag("--real")) {
 else {
 	runArgs.push("--fake");
 }
-runArgs.push("--node", opt("--node") || process.execPath);
+runArgs.push("--bun", opt("--bun") || process.execPath);
 if (useXpi) runArgs.push("--xpi", join(root, "build", `zotero-topk-${pkg.version}.xpi`));
 const res = spawnSync(process.execPath, runArgs, { stdio: "inherit", timeout: 15 * 60 * 1000, env: childEnv });
 if (!existsSync(report)) {

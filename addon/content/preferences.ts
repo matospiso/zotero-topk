@@ -34,13 +34,13 @@
 		}
 	}
 
-	async function browseNode() {
+	async function browseBun() {
 		const { FilePicker } = ChromeUtils.importESModule("chrome://zotero/content/modules/filePicker.mjs");
 		const fp = new FilePicker();
-		fp.init(window, "Select the Node.js executable", fp.modeOpen);
+		fp.init(window, "Select the Bun executable", fp.modeOpen);
 		if ((await fp.show()) === fp.returnOK && fp.path) {
-			Zotero.Prefs.set(PREF + "nodePath", fp.path, true);
-			$("zotero-topk-node")!.value = fp.path;
+			Zotero.Prefs.set(PREF + "bunPath", fp.path, true);
+			$("zotero-topk-bun")!.value = fp.path;
 		}
 	}
 
@@ -61,7 +61,7 @@
 			return;
 		}
 		$("zotero-topk-test")!.addEventListener("command", testConnection);
-		$("zotero-topk-node-browse")!.addEventListener("command", browseNode);
+		$("zotero-topk-bun-browse")!.addEventListener("command", browseBun);
 		$("zotero-topk-index-now")!.addEventListener("command", () => {
 			Zotero.TopK.indexAllLibraries({ force: false });
 			refreshIndexStatus();

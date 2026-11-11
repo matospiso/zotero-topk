@@ -97,7 +97,7 @@ class OperationLock {
 const DESTINATION_CHANGED = Symbol("destination changed");
 
 /**
- * Manages the local Node.js helper that hosts the TopK JavaScript SDK and
+ * Manages the local Bun helper that hosts the TopK JavaScript SDK and
  * exposes a tiny JSON API on 127.0.0.1.
  */
 export class Bridge {
@@ -108,7 +108,7 @@ export class Bridge {
 	private configured = false;
 	private configKey = "";
 	private lock = new OperationLock();
-	private nodePath = "";
+	private bunPath = "";
 	private bridgeDir = "";
 	public lastError = "";
 	public info: { version?: string; fake?: boolean } = {};
@@ -160,7 +160,7 @@ export class Bridge {
 	private async start(): Promise<void> {
 		this.lastError = "";
 		try {
-			this.nodePath = await this.findNode();
+			this.bunPath = await this.findBun();
 			this.bridgeDir = await this.prepareBridgeDir();
 			await this.installDependencies();
 			await this.spawn();
@@ -199,7 +199,7 @@ export class Bridge {
 	}
 
 	// ----------------------------------------------------------------------
-	// Node / dependency management
+	// Bun / dependency management
 	// ----------------------------------------------------------------------
 
 	private async fileExists(path: string): Promise<boolean> {
@@ -211,116 +211,55 @@ export class Bridge {
 		}
 	}
 
-	private async listDir(path: string): Promise<string[]> {
+	private async bunVersion(path: string): Promise<string | null> {
 		try {
-			return await IOUtils.getChildren(path);
-		}
-		catch (e) {
-			return [];
-		}
-	}
-
-	private async nodeVersion(path: string): Promise<string | null> {
-		try {
-			const proc = await Subprocess.call({ command: path, arguments: ["--version"], stderr: "stdout" });
+			// Check the runtime itself: `node --version` also looks like a version string.
+			const proc = await Subprocess.call({ command: path, arguments: ["--no-env-file", "-e", "console.log(Bun.version)"],
+				environment: childEnvironment({}), environmentAppend: false, stderr: "stdout" });
 			let out = "";
 			let chunk: string;
 			while ((chunk = await proc.stdout.readString())) out += chunk;
 			const { exitCode } = await proc.wait();
-			const m = out.match(/v(\d+)\.(\d+)\.(\d+)/);
-			if (exitCode !== 0 || !m) return null;
-			if (parseInt(m[1], 10) < 18) return null;
-			return m[0];
+			const version = out.trim();
+			const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
+			if (exitCode !== 0 || !match) return null;
+			const [major, minor, patch] = match.slice(1).map(Number);
+			return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 4))) ? version : null;
 		}
-		catch (e) {
-			return null;
-		}
+		catch { return null; }
 	}
 
-	private async candidateNodePaths(): Promise<string[]> {
+	private async candidateBunPaths(): Promise<string[]> {
 		const out: string[] = [];
-		const configured = getPref<string>("nodePath", "").trim();
+		const configured = getPref<string>("bunPath", "").trim();
 		if (configured) out.push(configured);
 		try {
-			const found = await Subprocess.pathSearch(Zotero.isWin ? "node.exe" : "node");
+			const found = await Subprocess.pathSearch(Zotero.isWin ? "bun.exe" : "bun");
 			if (found) out.push(found);
+		} catch {}
+		const home = Services.env.get(Zotero.isWin ? "USERPROFILE" : "HOME") || "";
+		if (home) {
+			out.push(PathUtils.join(home, ".bun", "bin", Zotero.isWin ? "bun.exe" : "bun"));
+			if (Zotero.isWin) out.push(PathUtils.join(home, "scoop", "shims", "bun.exe"));
+			else out.push(PathUtils.join(home, ".local", "bin", "bun"));
 		}
-		catch (e) {}
-		const home = Zotero.isWin
-			? (Services.env.get("USERPROFILE") || "")
-			: (Services.env.get("HOME") || "");
-		const versionDirs = async (base: string, suffix: string[]) => {
-			const children = await this.listDir(base);
-			// Highest version first
-			children.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
-			for (const c of children) out.push(PathUtils.join(c, ...suffix));
-		};
-		if (Zotero.isWin) {
-			const pf = Services.env.get("ProgramFiles") || "C:\\Program Files";
-			const local = Services.env.get("LOCALAPPDATA") || "";
-			out.push(PathUtils.join(pf, "nodejs", "node.exe"));
-			if (local) out.push(PathUtils.join(local, "Programs", "nodejs", "node.exe"));
-			if (home) {
-				await versionDirs(PathUtils.join(home, "AppData", "Roaming", "nvm"), ["node.exe"]);
-				await versionDirs(PathUtils.join(home, "AppData", "Roaming", "fnm", "node-versions"), ["installation", "node.exe"]);
-			}
-		}
-		else {
-			if (home) {
-				await versionDirs(PathUtils.join(home, ".nvm", "versions", "node"), ["bin", "node"]);
-				await versionDirs(PathUtils.join(home, ".local", "share", "fnm", "node-versions"), ["installation", "bin", "node"]);
-				await versionDirs(PathUtils.join(home, "Library", "Application Support", "fnm", "node-versions"), ["installation", "bin", "node"]);
-				out.push(PathUtils.join(home, ".volta", "bin", "node"));
-				out.push(PathUtils.join(home, ".local", "bin", "node"));
-			}
-			out.push("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node", "/snap/bin/node", "/opt/local/bin/node");
-			await versionDirs("/usr/local/n/versions/node", ["bin", "node"]);
-		}
-		return out;
+		if (!Zotero.isWin) out.push("/opt/homebrew/bin/bun", "/usr/local/bin/bun", "/usr/bin/bun");
+		return [...new Set(out)];
 	}
 
-	async findNode(): Promise<string> {
-		for (const candidate of await this.candidateNodePaths()) {
+	async findBun(): Promise<string> {
+		for (const candidate of await this.candidateBunPaths()) {
 			if (!(await this.fileExists(candidate))) continue;
-			const v = await this.nodeVersion(candidate);
-			if (v) {
-				log(`using Node.js ${v} at ${candidate}`);
-				return candidate;
-			}
+			const version = await this.bunVersion(candidate);
+			if (version) { log(`using Bun ${version} at ${candidate}`); return candidate; }
 		}
-		throw new BridgeError(
-			"Node.js 18 or newer was not found. Install it from https://nodejs.org and/or set the path in "
-			+ "Settings → TopK Semantic Search."
-		);
-	}
-
-	private async resolveSymlink(path: string): Promise<string> {
-		try {
-			const file = Zotero.File.pathToFile(path);
-			if (file.isSymlink()) return file.target;
-		}
-		catch (e) {}
-		return path;
-	}
-
-	/** Locate npm-cli.js next to the node binary (works without a login shell PATH). */
-	private async findNpmCli(nodePath: string): Promise<string | null> {
-		const real = await this.resolveSymlink(nodePath);
-		const dir = PathUtils.parent(real);
-		const candidates = [
-			PathUtils.join(dir, "node_modules", "npm", "bin", "npm-cli.js"),
-			PathUtils.join(PathUtils.parent(dir), "lib", "node_modules", "npm", "bin", "npm-cli.js"),
-		];
-		for (const c of candidates) {
-			if (await this.fileExists(c)) return c;
-		}
-		return null;
+		throw new BridgeError("Bun 1.4.4 or newer was not found. Install it from https://bun.sh and/or set the path in Settings → TopK Semantic Search.");
 	}
 
 	private async prepareBridgeDir(): Promise<string> {
 		const dir = PathUtils.join(Zotero.DataDirectory.dir, "topk-bridge");
 		await IOUtils.makeDirectory(dir, { ignoreExisting: true });
-		for (const name of ["server.js", "package.json", "package-lock.json"]) {
+		for (const name of ["server.ts", "package.json", "bun.lock"]) {
 			// getResourceAsync goes through an nsIChannel, so it also works for jar: URLs (installed xpi).
 			const src = await Zotero.File.getResourceAsync(`${this.rootURI}bridge/${name}`);
 			await IOUtils.writeUTF8(PathUtils.join(dir, name), src);
@@ -332,27 +271,17 @@ export class Bridge {
 		const dir = this.bridgeDir;
 		const stamp = PathUtils.join(dir, ".installed");
 		const pkgJson = JSON.parse(await IOUtils.readUTF8(PathUtils.join(dir, "package.json")));
-		const want = `${this.pluginVersion}:${pkgJson.dependencies["topk-js"]}:ci`;
+		const lock = await IOUtils.readUTF8(PathUtils.join(dir, "bun.lock"));
+		const want = `${this.pluginVersion}:${pkgJson.dependencies["topk-js"]}:bun:${Zotero.Utilities.Internal.md5(lock)}`;
 		const haveModule = await this.fileExists(PathUtils.join(dir, "node_modules", "topk-js", "package.json"));
 		let have = "";
 		try { have = (await IOUtils.readUTF8(stamp)).trim(); } catch (e) {}
 		if (haveModule && have === want) return;
 
-		const npmCli = await this.findNpmCli(this.nodePath);
-		let command = this.nodePath;
-		let args: string[];
-		if (npmCli) {
-			args = [npmCli];
-		}
-		else {
-			const npm = await Subprocess.pathSearch(Zotero.isWin ? "npm.cmd" : "npm").catch(() => null);
-			if (!npm) throw new BridgeError("npm was not found next to Node.js; install Node.js from https://nodejs.org");
-			command = npm;
-			args = [];
-		}
-		// `ci` installs exactly what the shipped lockfile pins (with integrity checks) and fails on any drift;
-		// the SDK ships prebuilt binaries as optional platform packages, so lifecycle scripts are not needed.
-		args.push("ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error");
+		// Use the shipped lockfile and integrity hashes. The SDK has prebuilt native
+		// packages, so dependency lifecycle scripts are neither needed nor allowed.
+		const command = this.bunPath;
+		const args = ["install", "--no-env-file", "--frozen-lockfile", "--production", "--ignore-scripts", "--no-progress"];
 
 		log(`installing bridge dependencies in ${dir}`);
 		const pw = new Zotero.ProgressWindow({ closeOnClick: false });
@@ -369,7 +298,7 @@ export class Bridge {
 			while ((chunk = await proc.stdout.readString())) out += chunk;
 			const { exitCode } = await proc.wait();
 			if (exitCode !== 0) {
-				throw new BridgeError(`npm install failed (exit ${exitCode}):\n${out.slice(-2000)}`);
+				throw new BridgeError(`Bun install failed (exit ${exitCode}):\n${out.slice(-2000)}`);
 			}
 			await IOUtils.writeUTF8(stamp, want);
 			log("bridge dependencies installed");
@@ -389,8 +318,8 @@ export class Bridge {
 		const extra: Record<string, string> = { TOPK_BRIDGE_TOKEN: this.token };
 		if (fake) extra.TOPK_BRIDGE_FAKE = "1";
 		const proc = await Subprocess.call({
-			command: this.nodePath,
-			arguments: [PathUtils.join(this.bridgeDir, "server.js")],
+			command: this.bunPath,
+			arguments: ["--no-env-file", PathUtils.join(this.bridgeDir, "server.ts")],
 			workdir: this.bridgeDir,
 			environment: childEnvironment(extra),
 			environmentAppend: false,

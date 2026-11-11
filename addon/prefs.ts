@@ -4,7 +4,7 @@ pref("extensions.zotero-topk.region", "aws-us-east-1-elastica");
 // Advanced: API host; empty = TopK production (topk.io). Endpoint is https://<region>.api.<host>
 pref("extensions.zotero-topk.host", "");
 pref("extensions.zotero-topk.collection", "zotero-pages");
-pref("extensions.zotero-topk.nodePath", "");
+pref("extensions.zotero-topk.bunPath", "");
 pref("extensions.zotero-topk.autoIndex", true);
 pref("extensions.zotero-topk.indexSnapshots", true);
 pref("extensions.zotero-topk.maxPages", 500);

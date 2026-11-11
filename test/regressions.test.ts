@@ -1,5 +1,4 @@
-import test, { type TestContext } from 'node:test';
-import { build } from 'esbuild';
+import { test as bunTest } from 'bun:test';
 import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, statSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -11,9 +10,22 @@ import path from 'node:path';
 import * as backendModule from '../bridge/server';
 // SDK and Zotero mocks intentionally expose internals so failure paths can be injected.
 const backendContext: any = backendModule;
+type TestContext = { after: (cleanup: () => unknown | Promise<unknown>) => void };
+function test(name: string, fn: (t: TestContext) => unknown): void;
+function test(name: string, options: { skip: boolean }, fn: (t: TestContext) => unknown): void;
+function test(name: string, options: { skip: boolean } | ((t: TestContext) => unknown), fn?: (t: TestContext) => unknown) {
+ const run = typeof options === 'function' ? options : fn!;
+ const register = typeof options === 'object' && options.skip ? bunTest.skip : bunTest;
+ register(name, async () => {
+  const cleanups: Array<() => unknown> = [];
+  try { await run({ after: (cleanup) => { cleanups.push(cleanup); } }); }
+  finally { for (const cleanup of cleanups) await cleanup(); }
+ });
+}
 async function bundleAPI(dev = false) {
- const result = await build({ entryPoints: ['test/plugin-api.ts'], bundle: true, platform: 'browser', format: 'cjs', write: false, define: { __DEV__: String(dev) } });
- return result.outputFiles[0].text;
+ const result = await Bun.build({ entrypoints: ['test/plugin-api.ts'], target: 'browser', format: 'cjs', define: { __DEV__: String(dev) } });
+ if (!result.success) throw new AggregateError(result.logs, 'Test plugin bundle failed');
+ return result.outputs[0].text();
 }
 const bundle = await bundleAPI();
 const defer = <T = void>() => {
@@ -440,7 +452,7 @@ for (const kind of ['real','fake']) test(`${kind} image responses stay below 8 M
 for (const script of ['e2e.ts','run-zotero.ts']) test(`${script} rejects command-line API keys without echoing them`, () => {
  const secret = 'never-provisioned-test-key';
  for (const args of [['--apikey',secret],[`--apikey=${secret}`]]) {
-  const result = spawnSync(process.execPath,["--import", "tsx", `scripts/${script}`,...args], { encoding:'utf8' });
+  const result = spawnSync(process.execPath,[`scripts/${script}`,...args], { encoding:'utf8' });
   assert.ifError(result.error);
   assert.equal(result.status,2);
   assert.match(result.stderr,/use TOPK_API_KEY/);
@@ -453,7 +465,7 @@ test('dev launcher tightens existing profile and credential-file permissions', {
  t.after(() => rmSync(dir,{ recursive:true, force:true }));
  const profile = path.join(dir,'profile'); const userPrefs = path.join(profile,'user.js');
  mkdirSync(profile); chmodSync(profile,0o777); writeFileSync(userPrefs,'old preferences'); chmodSync(userPrefs,0o666);
- const result = spawnSync(process.execPath,['--import','tsx','scripts/run-zotero.ts','--dev-dir',dir], {
+ const result = spawnSync(process.execPath,['scripts/run-zotero.ts','--dev-dir',dir], {
   env:{ ...process.env, ZOTERO_BIN:'/bin/true', TOPK_API_KEY:'never-provisioned-test-key' }, encoding:'utf8',
  });
  assert.ifError(result.error);
@@ -463,3 +475,39 @@ test('dev launcher tightens existing profile and credential-file permissions', {
  assert.ok(readFileSync(userPrefs,'utf8').includes('never-provisioned-test-key'));
 });
 
+test('Bun discovery validates the runtime and minimum version without inheriting environment options', async (t) => {
+ const calls: any[] = []; let version = '1.4.4'; let exitCode = 0;
+ const h = await harness(t, { subprocess: { call: async (options) => {
+  calls.push(options); let read = false;
+  return { stdout: { readString: async () => { if (read) return ''; read = true; return version + '\n'; } }, wait: async () => ({ exitCode }) };
+ } } });
+ assert.equal(await h.bridge.bunVersion('/bun'), '1.4.4');
+ version = '1.4.3'; assert.equal(await h.bridge.bunVersion('/bun'), null);
+ version = 'v22.0.0'; assert.equal(await h.bridge.bunVersion('/node'), null);
+ version = '1.4.4'; exitCode = 1; assert.equal(await h.bridge.bunVersion('/broken'), null);
+ assert.deepEqual(Array.from(calls[0].arguments), ['--no-env-file', '-e', 'console.log(Bun.version)']);
+ assert.equal(calls[0].environmentAppend, false);
+ assert.equal(calls[0].environment.HOME, '/mock/home');
+ assert.equal(calls[0].environment.BUN_OPTIONS, undefined);
+});
+
+test('Bun installation uses a frozen lockfile and invalidates the old npm or changed-lock stamp', async (t) => {
+ const calls: any[] = []; let exitCode = 0;
+ const h = await harness(t, { subprocess: { call: async (options) => {
+  calls.push(options); return { stdout: { readString: async () => '' }, wait: async () => ({ exitCode }) };
+ } } });
+ h.Zotero.ProgressWindow = class { changeHeadline() {} addDescription() {} show() {} startCloseTimer() {} };
+ h.bridge.bunPath = '/bun'; h.bridge.bridgeDir = '/mock/bridge';
+ h.files.set('/mock/bridge/package.json', JSON.stringify({ dependencies: { 'topk-js': '0.16.1' } }));
+ h.files.set('/mock/bridge/node_modules/topk-js/package.json', '{}');
+ h.files.set('/mock/bridge/bun.lock', 'first-lock'); h.files.set('/mock/bridge/.installed', 'test:0.16.1:ci');
+ await h.bridge.installDependencies(); assert.equal(calls.length, 1);
+ assert.deepEqual(Array.from(calls[0].arguments), ['install', '--no-env-file', '--frozen-lockfile', '--production', '--ignore-scripts', '--no-progress']);
+ assert.equal(calls[0].command, '/bun');
+ await h.bridge.installDependencies(); assert.equal(calls.length, 1);
+ const stamp = h.files.get('/mock/bridge/.installed');
+ h.files.set('/mock/bridge/bun.lock', 'changed-lock'); exitCode = 1;
+ await assert.rejects(h.bridge.installDependencies(), /Bun install failed/);
+ assert.equal(h.files.get('/mock/bridge/.installed'), stamp);
+ exitCode = 0; await h.bridge.installDependencies(); assert.notEqual(h.files.get('/mock/bridge/.installed'), stamp);
+});

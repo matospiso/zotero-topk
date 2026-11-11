@@ -38,7 +38,7 @@ const MAX_FAILED_VERSIONS = 3; // give up on a file version after this many non-
 // produced while rendering a document never drive retries or queue drops, so a document
 // author cannot influence scheduling through the text of a parser error.
 const TRANSIENT_ERROR = /Unavailable|temporarily unavailable|QuotaExceeded|Too many requests|timed out|timeout|deadline|transport|connection|bridge is not running|bridge exited/i;
-const SETUP_ERROR = /API key|not configured|Node\.js|npm|Invalid TopK|Invalid collection/i;
+const SETUP_ERROR = /API key|not configured|Bun .*not found|Bun install failed|Invalid TopK|Invalid collection/i;
 const STATE_PREFS = ["apiKey", "region", "host", "collection", "bridgeFake"];
 
 class JobCancelled extends Error {}
@@ -545,7 +545,7 @@ export class Indexer {
 				}
 				else {
 					this.setProgressText(`Failed: ${item.getDisplayTitle?.() || item.key} – ${this.lastError}`);
-					// Setup problems (no key, no Node.js): stop hammering, drop the queue.
+					// Setup problems (no key, no Bun): stop hammering, drop the queue.
 					if (isSetupError(e, this.lastError)) {
 						this.queue = [];
 						this.queued.clear();

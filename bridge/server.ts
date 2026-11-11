@@ -8,11 +8,6 @@
 //   TOPK_BRIDGE_TOKEN  shared secret; every request must send it as a Bearer token
 //   TOPK_BRIDGE_PORT   optional fixed port (default: random free port)
 //   TOPK_BRIDGE_FAKE   "1" → in-memory fake backend (plugin development/tests)
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
-const require = createRequire(import.meta.url);
-
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import crypto from "node:crypto";
 import { version as BRIDGE_VERSION } from "./package.json";
@@ -584,7 +579,7 @@ export function startServer({ token, port = 0, fake = false }: { token: string; 
 	return server;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main) {
 	startServer({ token: process.env.TOPK_BRIDGE_TOKEN || "", port: Number(process.env.TOPK_BRIDGE_PORT || 0), fake: process.env.TOPK_BRIDGE_FAKE === "1" });
 	// Exit when Zotero closes the session pipe, including an unexpected parent crash.
 	process.stdin.on("end", () => process.exit(0));

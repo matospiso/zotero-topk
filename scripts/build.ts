@@ -1,6 +1,5 @@
-// Builds the plugin: bundles TypeScript with esbuild, copies static files and the
+// Builds the plugin: bundles TypeScript with Bun, copies static files and the
 // bridge sources into build/addon/, and zips an installable .xpi.
-import { build, transform } from "esbuild";
 import { cpSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,9 +16,9 @@ rmSync(addonOut, { recursive: true, force: true });
 mkdirSync(addonOut, { recursive: true });
 cpSync(join(root, "addon"), addonOut, { recursive: true, filter: (src) => !src.endsWith(".ts") });
 mkdirSync(join(addonOut, "bridge"), { recursive: true });
-for (const f of ["package.json", "package-lock.json"]) cpSync(join(root, "bridge", f), join(addonOut, "bridge", f));
+for (const f of ["server.ts", "package.json", "bun.lock"]) cpSync(join(root, "bridge", f), join(addonOut, "bridge", f));
 
-// pdf.js (pinned via package-lock.json; the legacy build, since Zotero's Gecko lacks newer JS APIs) is bundled so the content-privileged renderer page can load it same-origin.
+// pdf.js (pinned via bun.lock; the legacy build, since Zotero's Gecko lacks newer JS APIs) is bundled so the content-privileged renderer page can load it same-origin.
 const pdfjs = join(root, "node_modules", "pdfjs-dist");
 const pdfOut = join(addonOut, "content", "pdfjs");
 mkdirSync(pdfOut, { recursive: true });
@@ -30,27 +29,32 @@ for (const d of ["cmaps", "standard_fonts", "wasm", "iccs"]) cpSync(join(pdfjs, 
 const manifestPath = join(addonOut, "manifest.json");
 writeFileSync(manifestPath, readFileSync(manifestPath, "utf8").replace("__version__", pkg.version));
 
-await build({
-	entryPoints: [join(root, "src/index.ts")], bundle: true, format: "iife", platform: "browser", target: "firefox115",
-	outfile: join(addonOut, "content/zotero-topk.js"), sourcemap: dev ? "inline" : false, define: { __DEV__: String(dev) },
+const result = await Bun.build({
+	entrypoints: [join(root, "src", "index.ts")],
+	format: "iife",
+	target: "browser",
+	outdir: join(addonOut, "content"),
+	naming: "zotero-topk.js",
+	sourcemap: dev ? "inline" : "none",
+	minify: false,
+	define: { __DEV__: String(dev) },
 });
-// Keep bootstrap lifecycle functions in the script's global scope.
+if (!result.success) throw new AggregateError(result.logs, "Plugin bundle failed");
+
+// Bootstrap callbacks and pref() calls must remain in the script's global scope.
+// Bundling them into an IIFE would hide the lifecycle functions from Zotero.
+const transpiler = new Bun.Transpiler({ loader: "ts", target: "browser" });
 for (const name of ["bootstrap", "prefs", "content/preferences"]) {
-	const { code } = await transform(readFileSync(join(root, "addon", `${name}.ts`), "utf8"), { loader: "ts", target: "firefox115" });
-	writeFileSync(join(addonOut, `${name}.js`), code);
+	writeFileSync(join(addonOut, `${name}.js`), transpiler.transformSync(readFileSync(join(root, "addon", `${name}.ts`), "utf8")));
 }
-await build({
-	entryPoints: [join(root, "addon/content/renderer.ts")], bundle: true, format: "esm", platform: "browser", target: "firefox115",
-	outfile: join(addonOut, "content/renderer.js"),
+const renderer = await Bun.build({
+	entrypoints: [join(root, "addon/content/renderer.ts")],
+	target: "browser", format: "esm", outdir: join(addonOut, "content"),
 	plugins: [{ name: "packaged-pdfjs", setup(build) {
 		build.onResolve({ filter: /^pdfjs-dist$/ }, () => ({ path: "./pdfjs/pdf.mjs", external: true }));
 	} }],
 });
-// Only the SDK stays external; the helper's package version is inlined from JSON.
-await build({
-	entryPoints: [join(root, "bridge/server.ts")], bundle: true, format: "esm", platform: "node", target: "node18",
-	outfile: join(addonOut, "bridge/server.js"), external: ["topk-js", "topk-js/*"],
-});
+if (!renderer.success) throw new AggregateError(renderer.logs, "Renderer bundle failed");
 
 if (xpiRequested) {
 	const xpi = join(out, `zotero-topk-${pkg.version}.xpi`);

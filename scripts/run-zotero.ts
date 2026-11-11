@@ -1,6 +1,6 @@
 // Launches Zotero with a throwaway profile that loads the plugin from build/addon.
 //
-//   npx tsx scripts/run-zotero.ts [--headless] [--fake] [--selftest out.json] [--data DIR] [--profile DIR]
+//   bun scripts/run-zotero.ts [--headless] [--fake] [--selftest out.json] [--data DIR] [--profile DIR]
 //
 // Set ZOTERO_BIN to your Zotero executable (Linux: .../zotero, macOS: Zotero.app/Contents/MacOS/zotero).
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, chmodSync } from "node:fs";
@@ -84,7 +84,7 @@ if (apiKey) prefs["extensions.zotero-topk.apiKey"] = apiKey;
 if (opt("--collection")) prefs["extensions.zotero-topk.collection"] = opt("--collection");
 if (opt("--region")) prefs["extensions.zotero-topk.region"] = opt("--region");
 if (opt("--host")) prefs["extensions.zotero-topk.host"] = opt("--host");
-prefs["extensions.zotero-topk.nodePath"] = opt("--node") || process.execPath;
+prefs["extensions.zotero-topk.bunPath"] = opt("--bun") || process.execPath;
 const userPrefsPath = join(profile, "user.js");
 // writeFileSync's mode only applies to new files. Tighten an existing profile
 // before writing credentials, and stop if its permissions cannot be changed.

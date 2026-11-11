@@ -3,13 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "description": "Local helper process that connects the Zotero TopK plugin to TopK's JavaScript SDK",
-  "main": "server.js",
+  "main": "server.ts",
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "bun": ">=1.4.4"
   },
   "dependencies": {
     "topk-js": "0.16.1"
   },
-  "type": "module"
+  "type": "module",
+  "packageManager": "bun@1.4.4"
 }
