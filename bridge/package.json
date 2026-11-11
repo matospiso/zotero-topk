@@ -1,0 +1,15 @@
+{
+  "name": "zotero-topk-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local helper process that connects the Zotero TopK plugin to TopK's JavaScript SDK",
+  "main": "server.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "topk-js": "0.16.1"
+  },
+  "type": "module"
+}
