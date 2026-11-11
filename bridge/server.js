@@ -215,8 +215,7 @@ class TopKBackend {
 		// Bound to the collection of the moment the request was accepted: a retry never crosses into another destination.
 		const col = this._col();
 		const lsn = await withRetry("upsert", () => col.upsert(payload));
-		this.lastLsn = lsn;
-		this.lastLsnAt = Date.now();
+		this.recordLsn(lsn);
 		return { ok: true, lsn, count: payload.length };
 	}
 
@@ -258,8 +257,7 @@ class TopKBackend {
 			// Always scoped to one library: a collection-wide delete is never issued.
 			const expr = field("library_key").eq(lib).and(field("attachment_key").in(chunk));
 			const lsn = await withRetry("delete", () => this._col().delete(expr));
-			this.lastLsn = lsn;
-			this.lastLsnAt = Date.now();
+			this.recordLsn(lsn);
 		}
 		return { ok: true, deleted: attachmentKeys.length };
 	}
@@ -269,8 +267,7 @@ class TopKBackend {
 		const lib = asLibraryKey(libraryKey);
 		const { field } = this._sdk().query;
 		const lsn = await withRetry("delete library", () => this._col().delete(field("library_key").eq(lib)));
-		this.lastLsn = lsn;
-		this.lastLsnAt = Date.now();
+		this.recordLsn(lsn);
 		return { ok: true, libraryKey: lib };
 	}
 
@@ -282,6 +279,13 @@ class TopKBackend {
 		const q = select("attachment_key").filter(field("library_key").eq(lib).and(field("attachment_key").eq(attachmentKey))).limit(1);
 		const docs = await withRetry("attachment status", () => col.query(q, this.readOptions()), { maxMs: 90000 });
 		return { exists: docs.length > 0 };
+	}
+
+	recordLsn(lsn) {
+		// Concurrent responses can arrive out of order. LSNs are decimal u64 strings,
+		// so compare without losing precision or weakening the read-your-writes fence.
+		if (!this.lastLsn || BigInt(lsn) > BigInt(this.lastLsn)) this.lastLsn = lsn;
+		this.lastLsnAt = Date.now();
 	}
 
 	readOptions() {
@@ -466,6 +470,7 @@ function scheduled(scopeOf, fn) {
 const list = (v) => (Array.isArray(v) ? v : []);
 const SCOPE = {
 	all: () => ({ all: true }),
+	read: () => ({}), // reads overlap writes, but must stay on their side of configure
 	upload: (body) => ({ upload: true, scopes: list(body.docs).map((d) => `${d && d.library_key}/${d && d.attachment_key}`) }),
 	attachments: (body) => ({ scopes: list(body.attachmentKeys).map((k) => `${body.libraryKey}/${k}`) }),
 	library: (body) => ({ scopes: [String(body.libraryKey)] }),
@@ -475,15 +480,15 @@ const backend = FAKE ? new FakeBackend() : new TopKBackend();
 
 const ROUTES = {
 	"GET /health": async () => ({ ok: true, version: BRIDGE_VERSION, fake: FAKE, configured: backend.configured }),
-	"GET /status": () => backend.status(),
+	"GET /status": scheduled(SCOPE.read, () => backend.status()),
 	"POST /configure": scheduled(SCOPE.all, (body) => backend.configure(body)),
 	"POST /upsert": scheduled(SCOPE.upload, (body) => backend.upsert(body)),
-	"POST /search": (body) => backend.search(body),
-	"POST /images": (body) => backend.images(body),
+	"POST /search": scheduled(SCOPE.read, (body) => backend.search(body)),
+	"POST /images": scheduled(SCOPE.read, (body) => backend.images(body)),
 	"POST /delete": scheduled(SCOPE.attachments, (body) => backend.deleteAttachments(body)),
 	"POST /delete-library": scheduled(SCOPE.library, (body) => backend.deleteLibrary(body)),
-	"POST /manifest": (body) => backend.manifest(body),
-	"POST /attachment-status": (body) => backend.hasAttachment(body),
+	"POST /manifest": scheduled(SCOPE.read, (body) => backend.manifest(body)),
+	"POST /attachment-status": scheduled(SCOPE.read, (body) => backend.hasAttachment(body)),
 	"POST /shutdown": async () => {
 		setTimeout(() => process.exit(0), 50);
 		return { ok: true };

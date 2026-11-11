@@ -114,6 +114,7 @@ export class Indexer {
 	private pendingDeletes: PendingDelete[] = [];
 	private prefObservers: any[] = [];
 	private activeJobs = new Set<ActiveJob>();
+	private uploads = new Set<Promise<unknown>>();
 	private targets = new Map<string, { state: Map<string, AttachmentState>; pendingDeletes: PendingDelete[] }>();
 	private writes: Promise<void> = Promise.resolve();
 	private deleting: Promise<void> | null = null;
@@ -481,9 +482,17 @@ export class Indexer {
 			let previous: Promise<void> = Promise.resolve();
 			do {
 				while (this.queue.length && !this.stopped) {
-					const job = this.queue.shift()!;
-					this.queued.delete(job.itemID);
+					const job = this.queue[0];
 					const item = Zotero.Items.get(job.itemID);
+					const sameAttachment = item && [...this.activeJobs].find((active) =>
+						active.libraryID === item.libraryID && active.key === item.key);
+					if (sameAttachment) {
+						// A rebuild must not delete pages before the previous version publishes its commit record.
+						await sameAttachment.done;
+						continue; // Removal or a destination change may have replaced the queue while waiting.
+					}
+					this.queue.shift();
+					this.queued.delete(job.itemID);
 					if (!item || this.hasPendingDelete(item.libraryID, item.key)) continue;
 					let finish!: () => void;
 					const active: ActiveJob = { libraryID: item.libraryID, key: item.key, target: this.target(),
@@ -644,6 +653,18 @@ export class Indexer {
 		}
 	}
 
+	/** Share the upload budget across documents, including their final completion records. */
+	private async startUpload(docs: PageDoc[], job: ActiveJob, check: () => void = () => {}) {
+		const limit = Math.max(1, Math.min(MAX_UPLOADS_IN_FLIGHT, getPref<number>("uploadConcurrency", 4)));
+		while (this.uploads.size >= limit) await Promise.race(this.uploads);
+		this.checkJob(job);
+		check();
+		const completion = this.bridge.upsert(docs);
+		const settled = completion.then(() => {}, () => {}).finally(() => this.uploads.delete(settled));
+		this.uploads.add(settled);
+		return { completion };
+	}
+
 	// The completion is wrapped so that awaiting this function does not adopt (and wait for) it.
 	private async uploadAttachment(item: any, kind: AttachmentKind, path: string, hash: string, title: string, itemKey: string, job: ActiveJob): Promise<{ completion: Promise<void> }> {
 		const sk = stateKey(item.libraryID, item.key);
@@ -654,7 +675,6 @@ export class Indexer {
 			set cancelled(value: boolean) { cancelled = value; },
 		};
 		const batchPages = Math.max(1, getPref<number>("uploadBatch", 8));
-		const uploadsInFlight = Math.max(1, Math.min(MAX_UPLOADS_IN_FLIGHT, getPref<number>("uploadConcurrency", 4)));
 		const opts = {
 			maxEdge: getPref<number>("maxEdge", 1536),
 			quality: getPref<number>("jpegQuality", 85),
@@ -681,12 +701,12 @@ export class Indexer {
 			const docs = batch;
 			batch = [];
 			batchBytes = 0;
-			while (inflight.size >= uploadsInFlight) await Promise.race(inflight);
-			this.checkJob(job);
-			if (signal.cancelled) throw new JobCancelled();
-			if (uploadError) throw uploadError;
 			const started = Date.now();
-			const p: Promise<unknown> = this.bridge.upsert(docs)
+			const { completion } = await this.startUpload(docs, job, () => {
+				if (signal.cancelled) throw new JobCancelled();
+				if (uploadError) throw uploadError;
+			});
+			const p: Promise<unknown> = completion
 				.then(() => {
 					uploaded += docs.length;
 					lastProgress = Date.now();
@@ -727,13 +747,14 @@ export class Indexer {
 			if (batch.length >= batchPages || batchBytes >= BATCH_B64_BYTES) await flush();
 		};
 		const started = Date.now();
+		let rendering = true;
 		// Watchdog: a stuck render or upload must not block the whole queue.
 		let watchdog: any = null;
 		const stalled = new Promise<never>((_, reject) => {
 			const check = () => {
 				if (Date.now() - lastProgress > stallLimit) {
 					signal.cancelled = true;
-					this.renderer.destroy(); // drop the pdf.js frame so the next document starts clean
+					if (rendering) this.renderer.destroy(); // a draining job no longer owns the shared frame
 					reject(new IndexingStall(`no progress for ${Math.round(stallLimit / 60000)} minutes (stalled at page ${done}/${total || "?"})`));
 					return;
 				}
@@ -747,7 +768,7 @@ export class Indexer {
 		const docTimeout = new Promise<never>((_, reject) => {
 			docTimer = setTimeout(() => {
 				signal.cancelled = true;
-				this.renderer.destroy();
+				if (rendering) this.renderer.destroy();
 				reject(new IndexingStall(`document took longer than ${Math.round(docTimeoutMs / 60000)} minutes (page ${done}/${total || "?"})`));
 			}, docTimeoutMs);
 		});
@@ -761,6 +782,7 @@ export class Indexer {
 				? this.renderer.renderPdf(path, opts, onPage)
 				: this.renderer.renderHtml(path, opts, onPage);
 			result = await Promise.race([render, stalled, docTimeout]);
+			rendering = false;
 			await flush();
 		}
 		catch (e) {
@@ -794,7 +816,8 @@ export class Indexer {
 				throw new Error("Renderer did not produce the complete expected page set");
 			}
 			// Page 1 is the commit record: it goes out only after every other page has been acknowledged.
-			await this.bridge.upsert([{ ...firstPage, indexed_pages: result.rendered }]);
+			const commit = await this.startUpload([{ ...firstPage, indexed_pages: result.rendered }], job);
+			await commit.completion;
 			this.checkJob(job);
 
 			this.state.set(sk, {
