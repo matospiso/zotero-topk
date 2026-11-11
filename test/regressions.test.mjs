@@ -11,14 +11,14 @@ import path from 'node:path';
 
 const bundle = (await build({ stdin: { contents: `export * from './src/indexer'; export * from './src/bridge'; export * from './src/search'; export * from './src/itemPane'; export * from './src/addon'; export * from './src/library'; export * from './src/selftest';`, resolveDir: process.cwd() }, bundle: true, write: false, format: 'cjs', platform: 'node', define: { __DEV__: 'false' } })).outputFiles[0].text;
 const backendContext = vm.createContext({ require: createRequire(new URL('../bridge/server.js', import.meta.url)), process: { env: { TOPK_BRIDGE_TOKEN: 'x'.repeat(32) } }, console, Buffer, setTimeout });
-vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('const backend = FAKE')[0] + '\nglobalThis.FakeBackend = FakeBackend; globalThis.TopKBackend = TopKBackend; globalThis.serializeMutation = serializeMutation;', backendContext);
+vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('const backend = FAKE')[0] + '\nglobalThis.FakeBackend = FakeBackend; globalThis.TopKBackend = TopKBackend; globalThis.scheduled = scheduled; globalThis.SCOPE = SCOPE;', backendContext);
 const defer = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 const tick = () => new Promise((r) => setImmediate(r));
 async function until(predicate) { for (let i = 0; i < 1000; i++) { if (predicate()) return; await tick(); } throw new Error('condition did not become true'); }
 
 async function harness(t, { backend = new backendContext.FakeBackend(), files = new Map(), groupLocalID = 2 } = {}) {
  const prefs = new Map(Object.entries({ apiKey: 'account-a', region: 'test', host: '', collection: 'pages', bridgeFake: true, uploadBatch: 1, autoIndex: false }).map(([k,v]) => ['extensions.zotero-topk.' + k,v]));
- const observers = new Map(); const timers = new Set(); const items = new Map();
+ const observers = new Map(); const timers = new Map(); const items = new Map();
  const libraries = [{ libraryID: 1, libraryType: 'user' }, { libraryID: groupLocalID, libraryType: 'group' }];
  const Zotero = {
   Prefs: { get: (k) => prefs.get(k), set(k, v) { prefs.set(k,v); for (const [name, fn] of observers.values()) if (name === k) fn(v); }, registerObserver(k, fn) { const id = {}; observers.set(id,[k,fn]); return id; }, unregisterObserver: (id) => observers.delete(id) },
@@ -33,7 +33,8 @@ async function harness(t, { backend = new backendContext.FakeBackend(), files = 
  };
  const context = vm.createContext({ module: { exports: {} }, Zotero, ChromeUtils: { importESModule: () => ({}) }, PathUtils: path,
   IOUtils: { exists: async (p) => files.has(p), readUTF8: async (p) => files.get(p), writeUTF8: async (p, v) => { files.set(p,v); }, computeHexDigest: async () => 'hash' },
-  setTimeout(fn, ms) { const timer = setTimeout(fn, ms); timers.add(timer); return timer; }, clearTimeout,
+  setTimeout(fn, ms) { const timer = setTimeout(fn, ms); timers.set(timer, { fn, ms }); return timer; },
+  clearTimeout(timer) { timers.delete(timer); clearTimeout(timer); },
  });
  vm.runInContext(bundle, context);
  const api = context.module.exports; const bridge = new api.Bridge('', 'test'); const requests = [];
@@ -43,11 +44,11 @@ async function harness(t, { backend = new backendContext.FakeBackend(), files = 
  const renderer = { calls: 0, destroy() {}, async renderPdf(_path, opts, onPage) { this.calls++; const count = Math.min(3, opts.maxPages); for (let page = 1; page <= count; page++) await onPage({ page, pageCount: 3, jpegB64: 'aW1hZ2U=' }); return { rendered: count, total: 3 }; } };
  renderer.renderHtml = (...args) => renderer.renderPdf(...args);
  const indexer = new api.Indexer(bridge, renderer); await indexer.start();
- t.after(async () => { indexer.stop(); await indexer.writes; for (const timer of timers) clearTimeout(timer); });
+ t.after(async () => { indexer.stop(); await indexer.writes; for (const timer of timers.keys()) clearTimeout(timer); });
  const addItem = (libraryID = 1, key = 'ABCDEFGH', id = items.size + 1) => { const item = { id, libraryID, key, deleted: false, isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true, getFilePathAsync: async () => '/fixture.pdf', getDisplayTitle: () => 'fixture' }; items.set(id, item); return item; };
  const setPref = (k,v) => Zotero.Prefs.set('extensions.zotero-topk.' + k,v);
  const idle = () => until(() => !indexer.running && !indexer.queue.length && !indexer.deleting);
- return { ...api, Zotero, bridge, indexer, backend, renderer, files, prefs, addItem, setPref, idle, requests, items };
+ return { ...api, Zotero, bridge, indexer, backend, renderer, files, prefs, addItem, setPref, idle, requests, items, timers };
 }
 
 test('destination state is isolated for collection, region, host, and API key and survives restart', async (t) => {
@@ -203,14 +204,145 @@ test('deletion self-test passes only when local state and all remote pages are a
  assert.equal(result.stillIndexed,false); assert.equal(result.remoteExists,false);
 });
 
-test('backend mutation ordering survives a disconnected upload caller', async () => {
- const gate = defer(); const order = [];
- const upload = backendContext.serializeMutation(async () => { order.push('upload started'); await gate.promise; order.push('upload finished'); });
- const remove = backendContext.serializeMutation(async () => { order.push('deleted'); });
- // The HTTP caller can time out and stop awaiting this promise; the backend must still drain it.
- const abandoned = upload(); await tick(); const deleting = remove(); await tick();
- assert.deepEqual(order,['upload started']); gate.resolve(); await deleting; await abandoned;
- assert.deepEqual(order,['upload started','upload finished','deleted']);
+test('backend request ordering is scoped: uploads overlap, deletions wait for their attachment, configure waits for all', async () => {
+ const { scheduled, SCOPE } = backendContext; const gate = defer(); const order = [];
+ const upload = scheduled(SCOPE.upload, async ({ docs }) => { order.push(`upload ${docs[0].attachment_key} started`); await gate.promise; order.push(`upload ${docs[0].attachment_key} finished`); });
+ const remove = scheduled(SCOPE.attachments, async ({ attachmentKeys }) => { order.push(`deleted ${attachmentKeys.join()}`); });
+ const removeLibrary = scheduled(SCOPE.library, async ({ libraryKey }) => { order.push(`deleted ${libraryKey}`); });
+ const configure = scheduled(SCOPE.all, async () => { order.push('configured'); });
+ const doc = (key, library = 'user:17') => ({ docs: [{ library_key: library, attachment_key: key }] });
+ // The HTTP caller can time out and stop awaiting an upload; the backend must still order deletions after it.
+ const abandoned = upload(doc('A')); const other = upload(doc('B')); await tick();
+ assert.deepEqual(order,['upload A started','upload B started']);
+ const deletingA = remove({ libraryKey: 'user:17', attachmentKeys: ['A'] });
+ const deletingC = remove({ libraryKey: 'user:17', attachmentKeys: ['C'] });
+ const deletingGroup = removeLibrary({ libraryKey: 'group:42' });
+ const laterA = upload(doc('A')); const configuring = configure({}); const afterConfigure = upload(doc('D'));
+ await tick(); await tick();
+ // Unrelated scopes proceed at once; A's deletion, the later A upload and the configure wait in order.
+ assert.deepEqual(order,['upload A started','upload B started','deleted C','deleted group:42']);
+ gate.resolve(); await Promise.all([abandoned, other, deletingA, deletingC, deletingGroup, laterA, configuring, afterConfigure]);
+ assert.deepEqual(order.slice(4),['upload A finished','upload B finished','deleted A','upload A started','upload A finished','configured','upload D started','upload D finished']);
+});
+
+test('uploads of one attachment are in flight together and the next attachment renders while they drain', async (t) => {
+ const h = await harness(t); const a = h.addItem(1,'AAAAAAAA'); const b = h.addItem(1,'BBBBBBBB');
+ const gate = defer(); let started = 0; const original = h.backend.upsert.bind(h.backend);
+ h.backend.upsert = async (body) => { started++; await gate.promise; return original(body); };
+ h.indexer.enqueue(a,false); h.indexer.enqueue(b,false);
+ await until(() => started >= 2); // pages 2 and 3 of A (uploadBatch 1) are sent without waiting for each other
+ await until(() => h.renderer.calls === 2); // B is rendered while A's uploads are still outstanding
+ assert.equal(h.indexer.getState(a)?.status,'partial'); assert.equal(h.backend.docs.size,0);
+ gate.resolve(); await h.idle();
+ assert.equal(h.indexer.getState(a)?.status,'ok'); assert.equal(h.indexer.getState(b)?.status,'ok'); assert.equal(h.backend.docs.size,6);
+ const commits = h.requests.filter((r) => r.route === '/upsert' && r.body.docs.some((d) => d.indexed_pages));
+ assert.deepEqual(commits.map((r) => r.body.docs[0].attachment_key),['AAAAAAAA','BBBBBBBB']);
+});
+
+test('a destination change waits for in-flight uploads and later requests wait for it', async (t) => {
+ const h = await harness(t); const item = h.addItem(); const gate = defer(); let started = 0; const original = h.backend.upsert.bind(h.backend);
+ h.backend.upsert = async (body) => { started++; await gate.promise; return original(body); };
+ h.indexer.enqueue(item,false); await until(() => started >= 2);
+ h.bridge.configured = false; const reconfigure = h.bridge.ensureReady(); const read = h.bridge.status(); await tick(); await tick();
+ assert.equal(h.requests.filter((r) => r.route === '/configure').length,1); assert.equal(h.requests.filter((r) => r.route === '/status').length,0);
+ gate.resolve(); await reconfigure; await read; await h.idle();
+ assert.deepEqual(h.requests.filter((r) => r.route === '/configure' || r.route === '/status').map((r) => r.route),['/configure','/configure','/status']);
+ assert.equal(h.indexer.getState(item)?.status,'ok');
+});
+
+test('reindexing the same attachment waits for its previous completion record', async (t) => {
+ const h = await harness(t); const item = h.addItem(); const gate = defer();
+ const original = h.backend.upsert.bind(h.backend); let started = 0;
+ h.backend.upsert = async (body) => { started++; await gate.promise; return original(body); };
+ const render = h.renderer.renderPdf.bind(h.renderer);
+ h.renderer.renderPdf = async (...args) => {
+  const result = await render(...args);
+  if (h.renderer.calls === 1) h.indexer.enqueue(item, true);
+  return result;
+ };
+ t.after(() => gate.resolve());
+ h.indexer.enqueue(item, false); await until(() => started >= 2);
+ await tick(); await tick();
+ assert.equal(h.requests.filter((r) => r.route === '/delete').length, 1);
+ gate.resolve(); await h.idle();
+ const writes = h.requests.filter((r) => r.route === '/delete' || r.route === '/upsert');
+ const commits = writes.flatMap((r, i) => r.body.docs?.some((d) => d.indexed_pages) ? [i] : []);
+ const deletes = writes.flatMap((r, i) => r.route === '/delete' ? [i] : []);
+ assert.equal(commits.length, 2); assert.equal(deletes.length, 2);
+ assert.ok(commits[0] < deletes[1]);
+ assert.equal(h.indexer.getState(item)?.status, 'ok');
+});
+
+test('uploadConcurrency bounds uploads across both pipelined attachments including commit records', async (t) => {
+ const h = await harness(t); h.setPref('uploadConcurrency', 2);
+ const gates = []; let active = 0, peak = 0;
+ const original = h.backend.upsert.bind(h.backend);
+ h.backend.upsert = async (body) => {
+  const gate = defer(); gates.push(gate); active++; peak = Math.max(peak, active);
+  try { await gate.promise; return await original(body); } finally { active--; }
+ };
+ t.after(() => gates.forEach((gate) => gate.resolve()));
+ h.indexer.enqueue(h.addItem(1, 'AAAAAAAA'), false);
+ h.indexer.enqueue(h.addItem(1, 'BBBBBBBB'), false);
+ await until(() => h.renderer.calls === 2); await tick();
+ assert.equal(active, 2);
+ for (let i = 0; i < 6; i++) { await until(() => gates.length > i); gates[i].resolve(); }
+ await h.idle(); assert.equal(peak, 2); assert.equal(h.backend.docs.size, 6);
+});
+
+test('a draining document timeout does not destroy the next document renderer', async (t) => {
+ const h = await harness(t); const a = h.addItem(1, 'AAAAAAAA'), b = h.addItem(1, 'BBBBBBBB');
+ const uploadGate = defer(), renderGate = defer(); let destroyed = 0, secondRendering = false;
+ const original = h.backend.upsert.bind(h.backend), render = h.renderer.renderPdf.bind(h.renderer);
+ h.backend.upsert = async (body) => { await uploadGate.promise; return original(body); };
+ h.renderer.destroy = () => { destroyed++; };
+ h.renderer.renderPdf = async (...args) => {
+  if (h.renderer.calls === 1) { secondRendering = true; await renderGate.promise; }
+  return render(...args);
+ };
+ t.after(() => { uploadGate.resolve(); renderGate.resolve(); });
+ h.indexer.enqueue(a, false); h.indexer.enqueue(b, false);
+ await until(() => secondRendering);
+ const timeout = [...h.timers.values()].find(({ ms }) => ms === 30 * 60000);
+ assert.ok(timeout); timeout.fn(); await tick();
+ assert.equal(destroyed, 0);
+ // Cancel the expired job's retry so the test can drain without a real backoff delay.
+ for (const job of h.indexer.activeJobs) if (job.key === a.key) job.signal.cancelled = true;
+ uploadGate.resolve(); renderGate.resolve(); await h.idle();
+ assert.equal(h.indexer.getState(b)?.status, 'ok');
+ assert.notEqual(h.indexer.getState(a)?.status, 'ok');
+});
+
+test('helper read routes wait for configure and configure drains abandoned reads', async () => {
+ const context = vm.createContext({ require: createRequire(new URL('../bridge/server.js', import.meta.url)),
+  process: { env: { TOPK_BRIDGE_TOKEN: 'x'.repeat(32), TOPK_BRIDGE_FAKE: '1' } }, console, Buffer, setTimeout });
+ vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('function readBody')[0]
+  + '\nglobalThis.routes = ROUTES; globalThis.backend = backend;', context);
+ const reads = [['GET /status', 'status'], ['POST /search', 'search'], ['POST /images', 'images'],
+  ['POST /manifest', 'manifest'], ['POST /attachment-status', 'hasAttachment']];
+ for (const [route, method] of reads) {
+  const readGate = defer(), configGate = defer(), order = [];
+  context.backend[method] = async () => { order.push('read'); await readGate.promise; };
+  context.backend.configure = async () => { order.push('configure'); await configGate.promise; };
+  const before = context.routes[route]({}); await tick();
+  const configure = context.routes['POST /configure']({}); const after = context.routes[route]({});
+  await tick(); assert.deepEqual(order, ['read'], route);
+  readGate.resolve(); await before; await tick(); assert.deepEqual(order, ['read', 'configure'], route);
+  configGate.resolve(); await Promise.all([configure, after]);
+  assert.deepEqual(order, ['read', 'configure', 'read'], route);
+ }
+});
+
+test('out-of-order upload responses keep the newest read fence without rounding u64 LSNs', async () => {
+ const backend = new backendContext.TopKBackend(); const older = defer(), newer = defer();
+ backend._sdk = () => ({ data: { image: (data) => ({ data }) } });
+ backend.client = { collection: () => ({ upsert: (docs) => docs[0]._id === 'old' ? older.promise : newer.promise }) };
+ const first = backend.upsert({ docs: [{ _id: 'old', page_image_b64: 'aW1hZ2U=' }] });
+ const second = backend.upsert({ docs: [{ _id: 'new', page_image_b64: 'aW1hZ2U=' }] });
+ newer.resolve('9007199254740993'); await second;
+ older.resolve('9007199254740992'); await first;
+ assert.equal(backend.readOptions().lsn, '9007199254740993');
+ backend.recordLsn('10000000000000000'); assert.equal(backend.readOptions().lsn, '10000000000000000');
 });
 
 test('real backend uses stable scopes and completion markers, including partial-page deletion', async () => {
@@ -230,7 +362,7 @@ test('real backend uses stable scopes and completion markers, including partial-
    if (q.sortField) rows.sort((a,b) => String(a[q.sortField]).localeCompare(String(b[q.sortField])) * (q.ascending ? 1 : -1));
    return rows.slice(0,q.count);
   },
-  delete: async (expr) => { for (const [id,doc] of documents) if (expr.matches(doc)) documents.delete(id); return 'delete-lsn'; },
+  delete: async (expr) => { for (const [id,doc] of documents) if (expr.matches(doc)) documents.delete(id); return '42'; },
  }) };
  documents.set('complete', { library_id:2, library_key:'group:42', attachment_key:'A', page:1, indexed_pages:2 });
  documents.set('partial', { library_id:2, library_key:'group:42', attachment_key:'B', page:2 });
@@ -242,7 +374,7 @@ test('real backend uses stable scopes and completion markers, including partial-
  await backend.deleteAttachments({ libraryKey:'group:42', attachmentKeys:['A','B'] });
  assert.equal(documents.size,2); assert.equal(documents.has('foreign'),true); assert.equal(documents.has('legacy'),true);
  assert.equal((await backend.hasAttachment({ libraryKey:'group:42', attachmentKey:'B' })).exists,false);
- assert.equal(reads.at(-1).lsn,'delete-lsn');
+ assert.equal(reads.at(-1).lsn,'42');
  await assert.rejects(backend.deleteLibrary({ libraryKey:2 }), /qualified Zotero library identity/);
 });
 

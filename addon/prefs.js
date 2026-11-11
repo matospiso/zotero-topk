@@ -15,9 +15,10 @@ pref("extensions.zotero-topk.docTimeoutMinutes", 30);
 pref("extensions.zotero-topk.maxEdge", 1536);
 pref("extensions.zotero-topk.jpegQuality", 85);
 pref("extensions.zotero-topk.resultLimit", 60);
-// Pages rendered concurrently, and pages per upsert request
+// Pages rendered concurrently, pages per upsert request, and upsert requests in flight at once
 pref("extensions.zotero-topk.renderConcurrency", 8);
 pref("extensions.zotero-topk.uploadBatch", 8);
+pref("extensions.zotero-topk.uploadConcurrency", 4);
 pref("extensions.zotero-topk.debug", false);
 // Development only: run the bridge with an in-memory fake instead of TopK.
 pref("extensions.zotero-topk.bridgeFake", false);

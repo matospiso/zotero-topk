@@ -103,6 +103,10 @@ moves it from its local identity to its synced user identity.
 
 ## Development
 
+Each pull request runs the regression suite, type checks, and builds an installable
+XPI. Open its **Test and build XPI** check and use the download link in the run
+summary (GitHub sign-in required; builds are retained for 30 days).
+
 ```sh
 npm install
 npm test                 # deterministic failure/race regression tests
@@ -165,6 +169,9 @@ test/       fixtures and probe queries
 | `docTimeoutMinutes` | `30` | give up on a document that takes longer than this |
 | `maxEdge` / `jpegQuality` | `1536` / `85` | page image size and quality (images are re‑encoded to stay under TopK's 512 KB image limit) |
 | `resultLimit` | `60` | page hits per search |
+| `renderConcurrency` | `8` | pages rendered concurrently |
+| `uploadBatch` | `8` | pages per upload request (also bounded by payload size) |
+| `uploadConcurrency` | `4` | upload requests in flight across documents, including completion records (clamped to 1–16) |
 
 ## Releasing
 

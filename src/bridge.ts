@@ -47,6 +47,10 @@ export function destination() {
 	};
 }
 
+function configKey({ apiKey, region, collection, host }: ReturnType<typeof destination>) {
+	return JSON.stringify([apiKey, region, collection, host]);
+}
+
 /** Credential fingerprint only: never persist the API key in index state. */
 export function destinationKey() {
 	return Zotero.Utilities.Internal.md5(JSON.stringify(destination()));
@@ -90,6 +94,41 @@ function childEnvironment(extra: Record<string, string>): Record<string, string>
 }
 
 /**
+ * Schedules helper requests so the client never idles while TopK has capacity: ordinary requests
+ * (uploads, reads, deletions) run concurrently, while reconfiguration runs alone, after every
+ * request already in flight has finished and before any later one starts. A preference change
+ * therefore cannot redirect an in-flight operation (including a backend retry) to another target.
+ * Ordering between uploads and deletions of the same attachment is the indexer's job on this side
+ * and the helper's on the other.
+ */
+class OperationLock {
+	private exclusive: Promise<void> = Promise.resolve();
+	private pendingExclusive = 0;
+	private shared = new Set<Promise<void>>();
+
+	async runShared<T>(fn: () => Promise<T>): Promise<T> {
+		while (this.pendingExclusive > 0) await this.exclusive;
+		const result = fn();
+		const settled = result.then(() => {}, () => {});
+		this.shared.add(settled);
+		try { return await result; }
+		finally { this.shared.delete(settled); }
+	}
+
+	runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+		this.pendingExclusive++;
+		const result = this.exclusive.then(async () => {
+			while (this.shared.size) await Promise.all(this.shared);
+			return fn();
+		});
+		this.exclusive = result.then(() => {}, () => {}).then(() => { this.pendingExclusive--; });
+		return result;
+	}
+}
+
+const DESTINATION_CHANGED = Symbol("destination changed");
+
+/**
  * Manages the local Node.js helper that hosts the TopK JavaScript SDK and
  * exposes a tiny JSON API on 127.0.0.1.
  */
@@ -100,7 +139,7 @@ export class Bridge {
 	private startPromise: Promise<void> | null = null;
 	private configured = false;
 	private configKey = "";
-	private operations: Promise<unknown> = Promise.resolve();
+	private lock = new OperationLock();
 	private nodePath = "";
 	private bridgeDir = "";
 	public lastError = "";
@@ -142,8 +181,8 @@ export class Bridge {
 		if (!HOST_LABEL.test(region)) throw new BridgeError(`Invalid TopK region “${region}”: use a region name such as aws-us-east-1-elastica.`);
 		if (host && !HOST_NAME.test(host)) throw new BridgeError(`Invalid TopK host “${host}”: use a hostname such as topk.io.`);
 		if (!COLLECTION_NAME.test(collection)) throw new BridgeError("Invalid collection name: use letters, digits, “-” and “_” only.");
-		const key = JSON.stringify([apiKey, region, collection, host]);
-		if (this.configured && this.configKey === key) return;
+		const key = configKey(config);
+		if (this.configuredFor(key)) return;
 		const res = await this.request("POST", "/configure", { apiKey, region, collection, host: host || undefined });
 		this.configured = true;
 		this.configKey = key;
@@ -477,16 +516,29 @@ export class Bridge {
 		}
 	}
 
-	// Configuration and its request share a lock. A preference change cannot
-	// redirect an in-flight operation (including a backend retry) to another target.
-	private operation(path?: string, body?: unknown, timeout = 120000): Promise<any> {
+	private configuredFor(key: string) {
+		return this.configured && this.configKey === key;
+	}
+
+	// The destination is fixed when the operation is issued. Configuring the helper for it runs
+	// exclusively; the request itself then runs alongside other requests, and is retried from the
+	// start if another caller moved the helper to a different destination in between.
+	private async operation(path?: string, body?: unknown, timeout = 120000): Promise<any> {
 		const config = destination();
-		const result = this.operations.then(async () => {
-			await this.configure(config);
-			return path ? this.request(path === "/status" ? "GET" : "POST", path, body, timeout) : undefined;
-		});
-		this.operations = result.catch(() => {});
-		return result;
+		const key = configKey(config);
+		if (!path) {
+			if (this.configuredFor(key)) return;
+			return this.lock.runExclusive(() => this.configure(config));
+		}
+		for (let attempt = 0; attempt < 3; attempt++) {
+			if (!this.configuredFor(key)) await this.lock.runExclusive(() => this.configure(config));
+			const result = await this.lock.runShared(async () => {
+				if (!this.configuredFor(key)) return DESTINATION_CHANGED;
+				return this.request(path === "/status" ? "GET" : "POST", path, body, timeout);
+			});
+			if (result !== DESTINATION_CHANGED) return result;
+		}
+		throw new BridgeError("The TopK destination changed while the request was waiting");
 	}
 
 	async status() { return this.operation("/status"); }

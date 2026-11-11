@@ -60,7 +60,7 @@ function isSetupError(e: unknown, msg: string) {
 
 const MAX_IMAGE_BYTES = 500 * 1024; // TopK limit is 512 KB
 const BATCH_B64_BYTES = 5 * 1024 * 1024; // stay below the 8 MB upsert limit even with base64 overhead
-const UPLOADS_IN_FLIGHT = 2;
+const MAX_UPLOADS_IN_FLIGHT = 16;
 const STALL_TIMEOUT_MS = 4 * 60 * 1000; // no page progress for this long while rendering → give up on the document
 // While only uploads are outstanding, allow for the bridge's own retry window (cold cluster start):
 // the HTTP request itself times out after 300 s, so a hung upload still surfaces as an error.
@@ -113,7 +113,8 @@ export class Indexer {
 	public onChange: (() => void) | null = null;
 	private pendingDeletes: PendingDelete[] = [];
 	private prefObservers: any[] = [];
-	private activeJob: ActiveJob | null = null;
+	private activeJobs = new Set<ActiveJob>();
+	private uploads = new Set<Promise<unknown>>();
 	private targets = new Map<string, { state: Map<string, AttachmentState>; pendingDeletes: PendingDelete[] }>();
 	private writes: Promise<void> = Promise.resolve();
 	private deleting: Promise<void> | null = null;
@@ -160,7 +161,7 @@ export class Indexer {
 
 	stop() {
 		this.stopped = true;
-		if (this.activeJob) this.activeJob.signal.cancelled = true;
+		for (const job of this.activeJobs) job.signal.cancelled = true;
 		if (this.notifierID) {
 			Zotero.Notifier.unregisterObserver(this.notifierID);
 			this.notifierID = null;
@@ -232,7 +233,7 @@ export class Indexer {
 	private async resetStateIfTargetChanged() {
 		const target = this.target();
 		if (target === this.lastTarget) return;
-		if (this.activeJob) this.activeJob.signal.cancelled = true;
+		for (const job of this.activeJobs) job.signal.cancelled = true;
 		this.queue = [];
 		this.queued.clear();
 		this.selectTarget(target);
@@ -370,10 +371,11 @@ export class Indexer {
 		const pending = this.pendingDeletes;
 		const work = async () => {
 			for (const d of [...pending]) {
-				const active = this.activeJob;
-				if (active && active.target === target && active.libraryID === d.libraryID && (!d.key || d.key === active.key)) {
-					active.signal.cancelled = true;
-					await active.done;
+				for (const active of [...this.activeJobs]) {
+					if (active.target === target && active.libraryID === d.libraryID && (!d.key || d.key === active.key)) {
+						active.signal.cancelled = true;
+						await active.done;
+					}
 				}
 				if (this.stopped || this.target() !== target) return;
 				try {
@@ -474,58 +476,89 @@ export class Indexer {
 		this.running = true;
 		try {
 			try { await this.flushPendingDeletes(); } catch (e) { logError("pending deletes", e); }
-			while (this.queue.length && !this.stopped) {
-				const job = this.queue.shift()!;
-				this.queued.delete(job.itemID);
-				const item = Zotero.Items.get(job.itemID);
-				if (!item || this.hasPendingDelete(item.libraryID, item.key)) continue;
-				let finish!: () => void;
-				const active: ActiveJob = { libraryID: item.libraryID, key: item.key, target: this.target(),
-					signal: { cancelled: false }, done: new Promise<void>((resolve) => { finish = resolve; }) };
-				this.activeJob = active;
-				try {
-					await this.resetStateIfTargetChanged();
-					await this.indexAttachment(item, job.force, active);
-					this.lastError = "";
-				}
-				catch (e) {
-					if (e instanceof JobCancelled || active.signal.cancelled || active.target !== this.target()) continue;
-					this.lastError = errorMessage(e);
-					logError(`indexing ${item.key}`, e);
-					const attempt = (job.attempt || 1);
-					if (isTransient(e, this.lastError) && attempt < MAX_ATTEMPTS) {
-						// e.g. the cluster is scaling from zero: back off and try this one again later.
-						const wait = Math.min(60000, 5000 * 2 ** (attempt - 1));
-						log(`will retry ${item.key} in ${wait / 1000}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
-						this.setProgressText(`Waiting for TopK… (${item.getDisplayTitle?.() || item.key})`);
-						await delay(wait);
-						if (!this.stopped && !active.signal.cancelled && active.target === this.target()) {
-							this.queue.push({ itemID: job.itemID, force: job.force, attempt: attempt + 1 });
-							this.queued.add(job.itemID);
-							this.progressTotal++;
-						}
-						continue;
+			// Pipeline: while one attachment's last uploads and its commit record are still in flight,
+			// the next attachment is already hashed, cleared and rendering. TopK sets the pace through
+			// backpressure on the uploads; the client does not idle between documents.
+			let previous: Promise<void> = Promise.resolve();
+			do {
+				while (this.queue.length && !this.stopped) {
+					const job = this.queue[0];
+					const item = Zotero.Items.get(job.itemID);
+					const sameAttachment = item && [...this.activeJobs].find((active) =>
+						active.libraryID === item.libraryID && active.key === item.key);
+					if (sameAttachment) {
+						// A rebuild must not delete pages before the previous version publishes its commit record.
+						await sameAttachment.done;
+						continue; // Removal or a destination change may have replaced the queue while waiting.
 					}
+					this.queue.shift();
+					this.queued.delete(job.itemID);
+					if (!item || this.hasPendingDelete(item.libraryID, item.key)) continue;
+					let finish!: () => void;
+					const active: ActiveJob = { libraryID: item.libraryID, key: item.key, target: this.target(),
+						signal: { cancelled: false }, done: new Promise<void>((resolve) => { finish = resolve; }) };
+					this.activeJobs.add(active);
+					let completion: Promise<void>;
+					try {
+						await this.resetStateIfTargetChanged();
+						completion = (await this.indexAttachment(item, job.force, active))?.completion ?? Promise.resolve();
+					}
+					catch (e) {
+						completion = Promise.reject(e);
+					}
+					completion.catch(() => {});
+					// At most one attachment drains while the next one renders.
+					await previous;
+					previous = this.settle(job, item, active, completion, finish);
+				}
+				await previous;
+			} while (this.queue.length && !this.stopped); // a retry may have been queued while draining
+		}
+		finally {
+			this.running = false;
+			this.finishProgress();
+		}
+	}
+
+	/** Waits for an attachment's remaining uploads and commit record, records the outcome, and schedules a retry if warranted. */
+	private async settle(job: Job, item: any, active: ActiveJob, completion: Promise<void>, finish: () => void) {
+		try {
+			await completion;
+			this.lastError = "";
+		}
+		catch (e) {
+			if (!(e instanceof JobCancelled || active.signal.cancelled || active.target !== this.target())) {
+				this.lastError = errorMessage(e);
+				logError(`indexing ${item.key}`, e);
+				const attempt = (job.attempt || 1);
+				if (isTransient(e, this.lastError) && attempt < MAX_ATTEMPTS) {
+					// e.g. the cluster is scaling from zero: back off and try this one again later.
+					const wait = Math.min(60000, 5000 * 2 ** (attempt - 1));
+					log(`will retry ${item.key} in ${wait / 1000}s (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+					this.setProgressText(`Waiting for TopK… (${item.getDisplayTitle?.() || item.key})`);
+					await delay(wait);
+					if (!this.stopped && !active.signal.cancelled && active.target === this.target()) {
+						this.queue.push({ itemID: job.itemID, force: job.force, attempt: attempt + 1 });
+						this.queued.add(job.itemID);
+						this.progressTotal++;
+					}
+				}
+				else {
 					this.setProgressText(`Failed: ${item.getDisplayTitle?.() || item.key} – ${this.lastError}`);
 					// Setup problems (no key, no Node.js): stop hammering, drop the queue.
 					if (isSetupError(e, this.lastError)) {
 						this.queue = [];
 						this.queued.clear();
-						break;
 					}
-				}
-				finally {
-					this.activeJob = null;
-					finish();
-					this.progressDone++;
-					this.current = null;
-					this.onChange?.();
 				}
 			}
 		}
 		finally {
-			this.running = false;
-			this.finishProgress();
+			this.activeJobs.delete(active);
+			finish();
+			this.progressDone++;
+			if (this.current?.itemID === item.id) this.current = null;
+			this.onChange?.();
 		}
 	}
 
@@ -555,7 +588,12 @@ export class Indexer {
 		return { parent, title: String(title).slice(0, 500), itemKey: parent ? parent.key : item.key };
 	}
 
-	private async indexAttachment(item: any, force: boolean, job: ActiveJob) {
+	/**
+	 * Prepares and renders one attachment. Resolves once rendering has finished, with a promise for the
+	 * remaining uploads, the commit record and the state update, so the queue can start the next
+	 * attachment while this one drains. Resolves to undefined when the attachment is skipped.
+	 */
+	private async indexAttachment(item: any, force: boolean, job: ActiveJob): Promise<{ completion: Promise<void> } | undefined> {
 		this.checkJob(job);
 		const kind = classifyAttachment(item);
 		if (!kind) return;
@@ -593,13 +631,7 @@ export class Indexer {
 		this.state.set(sk, { libraryID: item.libraryID, key: item.key, hash, pages: 0, totalPages: 0, kind, at: Date.now(), status: "partial" });
 		await this.saveState(true);
 		this.checkJob(job);
-		try {
-			// Always clear an interrupted remote version, including one unknown locally.
-			await this.bridge.deleteAttachments(item.libraryID, [item.key]);
-			this.checkJob(job);
-			await this.uploadAttachment(item, kind, path, hash, title, itemKey, job);
-		}
-		catch (e) {
+		const recordFailure = async (e: unknown) => {
 			const msg = errorMessage(e);
 			if (!(e instanceof JobCancelled) && !isTransient(e, msg) && !job.signal.cancelled && job.target === this.target()) {
 				// Remember the failure so a document that always fails is not re-rendered on every startup.
@@ -607,11 +639,34 @@ export class Indexer {
 				this.state.set(sk, { libraryID: item.libraryID, key: item.key, hash, pages: 0, totalPages: 0, kind, at: Date.now(), status: "failed", attempts, error: msg.slice(0, 300) });
 				await this.saveState();
 			}
+		};
+		try {
+			// Always clear an interrupted remote version, including one unknown locally.
+			await this.bridge.deleteAttachments(item.libraryID, [item.key]);
+			this.checkJob(job);
+			const { completion } = await this.uploadAttachment(item, kind, path, hash, title, itemKey, job);
+			return { completion: completion.catch(async (e) => { await recordFailure(e); throw e; }) };
+		}
+		catch (e) {
+			await recordFailure(e);
 			throw e;
 		}
 	}
 
-	private async uploadAttachment(item: any, kind: AttachmentKind, path: string, hash: string, title: string, itemKey: string, job: ActiveJob) {
+	/** Share the upload budget across documents, including their final completion records. */
+	private async startUpload(docs: PageDoc[], job: ActiveJob, check: () => void = () => {}) {
+		const limit = Math.max(1, Math.min(MAX_UPLOADS_IN_FLIGHT, getPref<number>("uploadConcurrency", 4)));
+		while (this.uploads.size >= limit) await Promise.race(this.uploads);
+		this.checkJob(job);
+		check();
+		const completion = this.bridge.upsert(docs);
+		const settled = completion.then(() => {}, () => {}).finally(() => this.uploads.delete(settled));
+		this.uploads.add(settled);
+		return { completion };
+	}
+
+	// The completion is wrapped so that awaiting this function does not adopt (and wait for) it.
+	private async uploadAttachment(item: any, kind: AttachmentKind, path: string, hash: string, title: string, itemKey: string, job: ActiveJob): Promise<{ completion: Promise<void> }> {
 		const sk = stateKey(item.libraryID, item.key);
 
 		let cancelled = false;
@@ -646,12 +701,12 @@ export class Indexer {
 			const docs = batch;
 			batch = [];
 			batchBytes = 0;
-			while (inflight.size >= UPLOADS_IN_FLIGHT) await Promise.race(inflight);
-			this.checkJob(job);
-			if (signal.cancelled) throw new JobCancelled();
-			if (uploadError) throw uploadError;
 			const started = Date.now();
-			const p: Promise<unknown> = this.bridge.upsert(docs)
+			const { completion } = await this.startUpload(docs, job, () => {
+				if (signal.cancelled) throw new JobCancelled();
+				if (uploadError) throw uploadError;
+			});
+			const p: Promise<unknown> = completion
 				.then(() => {
 					uploaded += docs.length;
 					lastProgress = Date.now();
@@ -692,13 +747,14 @@ export class Indexer {
 			if (batch.length >= batchPages || batchBytes >= BATCH_B64_BYTES) await flush();
 		};
 		const started = Date.now();
+		let rendering = true;
 		// Watchdog: a stuck render or upload must not block the whole queue.
 		let watchdog: any = null;
 		const stalled = new Promise<never>((_, reject) => {
 			const check = () => {
 				if (Date.now() - lastProgress > stallLimit) {
 					signal.cancelled = true;
-					this.renderer.destroy(); // drop the pdf.js frame so the next document starts clean
+					if (rendering) this.renderer.destroy(); // a draining job no longer owns the shared frame
 					reject(new IndexingStall(`no progress for ${Math.round(stallLimit / 60000)} minutes (stalled at page ${done}/${total || "?"})`));
 					return;
 				}
@@ -712,54 +768,72 @@ export class Indexer {
 		const docTimeout = new Promise<never>((_, reject) => {
 			docTimer = setTimeout(() => {
 				signal.cancelled = true;
-				this.renderer.destroy();
+				if (rendering) this.renderer.destroy();
 				reject(new IndexingStall(`document took longer than ${Math.round(docTimeoutMs / 60000)} minutes (page ${done}/${total || "?"})`));
 			}, docTimeoutMs);
 		});
+		const clearTimers = () => {
+			if (watchdog) clearTimeout(watchdog);
+			if (docTimer) clearTimeout(docTimer);
+		};
 		let result: { rendered: number; total: number };
-		let renderedSuccessfully = false;
 		try {
 			const render = kind === "pdf"
 				? this.renderer.renderPdf(path, opts, onPage)
 				: this.renderer.renderHtml(path, opts, onPage);
 			result = await Promise.race([render, stalled, docTimeout]);
+			rendering = false;
 			await flush();
-			lastProgress = Date.now();
-			stallLimit = UPLOAD_STALL_TIMEOUT_MS;
-			this.setProgressText(`${title} — uploading ${result.rendered - uploaded} page(s)…`);
-			await Promise.race([Promise.all(inflight), stalled, docTimeout]);
-			renderedSuccessfully = true;
 		}
-		finally {
-			if (watchdog) clearTimeout(watchdog);
-			if (docTimer) clearTimeout(docTimer);
+		catch (e) {
+			clearTimers();
 			// Prevent late renderer callbacks from starting uploads after a failure, and
 			// drain requests already sent before a retry or a final removal can proceed.
-			if (!renderedSuccessfully) signal.cancelled = true;
+			signal.cancelled = true;
 			await Promise.allSettled(inflight);
+			throw e;
 		}
-		if (uploadError) throw uploadError;
-		this.checkJob(job);
-		if (!firstPage || result.rendered !== Math.min(result.total, opts.maxPages)
-			|| seen.size !== result.rendered || uploaded !== result.rendered - 1
-			|| [...seen].some((page) => page < 1 || page > result.rendered)) {
-			throw new Error("Renderer did not produce the complete expected page set");
-		}
-		await this.bridge.upsert([{ ...firstPage, indexed_pages: result.rendered }]);
-		this.checkJob(job);
+		lastProgress = Date.now();
+		stallLimit = UPLOAD_STALL_TIMEOUT_MS;
+		this.setProgressText(`${title} — uploading ${result.rendered - uploaded} page(s)…`);
+		// Rendering is done; the queue may start the next attachment while these uploads drain.
+		const completion = (async () => {
+			let drained = false;
+			try {
+				await Promise.race([Promise.all(inflight), stalled, docTimeout]);
+				drained = true;
+			}
+			finally {
+				clearTimers();
+				if (!drained) signal.cancelled = true;
+				await Promise.allSettled(inflight);
+			}
+			if (uploadError) throw uploadError;
+			this.checkJob(job);
+			if (!firstPage || result.rendered !== Math.min(result.total, opts.maxPages)
+				|| seen.size !== result.rendered || uploaded !== result.rendered - 1
+				|| [...seen].some((page) => page < 1 || page > result.rendered)) {
+				throw new Error("Renderer did not produce the complete expected page set");
+			}
+			// Page 1 is the commit record: it goes out only after every other page has been acknowledged.
+			const commit = await this.startUpload([{ ...firstPage, indexed_pages: result.rendered }], job);
+			await commit.completion;
+			this.checkJob(job);
 
-		this.state.set(sk, {
-			libraryID: item.libraryID,
-			key: item.key,
-			hash,
-			pages: result.rendered,
-			totalPages: result.total,
-			kind,
-			at: Date.now(),
-			status: "ok",
-		});
-		await this.saveState();
-		log(`indexed ${item.key}: ${result.rendered}/${result.total} page(s) in ${((Date.now() - started) / 1000).toFixed(1)}s (${(result.rendered / ((Date.now() - started) / 1000)).toFixed(1)} pages/s)`);
+			this.state.set(sk, {
+				libraryID: item.libraryID,
+				key: item.key,
+				hash,
+				pages: result.rendered,
+				totalPages: result.total,
+				kind,
+				at: Date.now(),
+				status: "ok",
+			});
+			await this.saveState();
+			log(`indexed ${item.key}: ${result.rendered}/${result.total} page(s) in ${((Date.now() - started) / 1000).toFixed(1)}s (${(result.rendered / ((Date.now() - started) / 1000)).toFixed(1)} pages/s)`);
+		})();
+		return { completion };
 	}
 
 	async remove(libraryID: number, key: string) {
@@ -782,8 +856,9 @@ export class Indexer {
 				this.pending.delete(id);
 			}
 		}
-		const active = this.activeJob;
-		if (active && active.libraryID === libraryID && (!key || active.key === key)) active.signal.cancelled = true;
+		for (const active of this.activeJobs) {
+			if (active.libraryID === libraryID && (!key || active.key === key)) active.signal.cancelled = true;
+		}
 		this.queue = this.queue.filter((job) => {
 			const item = Zotero.Items.get(job.itemID);
 			const keep = item && (item.libraryID !== libraryID || (key && item.key !== key));
