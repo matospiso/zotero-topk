@@ -3,9 +3,9 @@
 // (src/renderer.ts) reads the file, hands the bytes in, and receives page images back through
 // an exported callback. pdf.js is bundled with the plugin (content/pdfjs/) so everything the
 // parser fetches is same-origin.
-import type { RenderedPage, RenderOptions } from "../../src/renderer";
-type ContentRenderOptions = Omit<RenderOptions, "signal"> & { isCancelled?: () => boolean };
-declare global { interface Window { TopKRenderer: { version: number; renderPdf: typeof renderPdf } } }
+import { MAX_IMAGE_BYTES, type RenderedPage, type ContentRenderOptions } from "../../shared/rendering";
+import { DEFAULT_PREFS } from "../../shared/preferences";
+declare global { interface Window { TopKRenderer: { renderPdf: typeof renderPdf } } }
 
 import * as pdfjsLib from "pdfjs-dist";
 
@@ -34,10 +34,6 @@ function blobToBase64(blob: Blob) {
 	});
 }
 
-/**
- * Encode a canvas as JPEG, lowering quality and then resolution until the
- * result fits under `maxBytes` (TopK caps images at 512 KB).
- */
 async function encodeJpeg(canvas: HTMLCanvasElement, quality: number, maxBytes: number) {
 	let current = canvas;
 	let q = quality;
@@ -45,7 +41,7 @@ async function encodeJpeg(canvas: HTMLCanvasElement, quality: number, maxBytes: 
 		const blob = await toBlob(current, q);
 		if (!blob) throw new Error("JPEG encoding failed");
 		if (blob.size <= maxBytes) {
-			return { blob, quality: q, width: current.width, height: current.height };
+			return blob;
 		}
 		if (q > 0.6) {
 			q = Math.max(0.55, q - 0.1);
@@ -62,18 +58,13 @@ async function encodeJpeg(canvas: HTMLCanvasElement, quality: number, maxBytes: 
 	throw new Error("could not fit page image under " + maxBytes + " bytes");
 }
 
-/**
- * @param data     Uint8Array with the PDF bytes (cloned into this window by the caller)
- * @param opts     { maxEdge, quality, maxBytes, maxPages, concurrency, isCancelled() }
- * @param onPage   callback(pageInfo) -> Promise, exported from the privileged side
- */
 async function renderPdf(data: Uint8Array, opts: ContentRenderOptions, onPage: (page: RenderedPage) => Promise<void>) {
 	ensureWorker();
-	const maxEdge = Math.max(256, Math.min(4096, opts.maxEdge || 1536));
-	const quality = Math.max(0.3, Math.min(1, (opts.quality || 85) / 100));
-	const maxBytes = opts.maxBytes || 500 * 1024;
-	const maxPages = Math.max(1, opts.maxPages || 500);
-	const concurrency = Math.max(1, Math.min(16, opts.concurrency || 8));
+	const maxEdge = Math.max(256, Math.min(4096, opts.maxEdge || DEFAULT_PREFS.maxEdge));
+	const quality = Math.max(0.3, Math.min(1, (opts.quality || DEFAULT_PREFS.jpegQuality) / 100));
+	const maxBytes = opts.maxBytes || MAX_IMAGE_BYTES;
+	const maxPages = Math.max(1, opts.maxPages || DEFAULT_PREFS.maxPages);
+	const concurrency = Math.max(1, Math.min(16, opts.concurrency || DEFAULT_PREFS.renderConcurrency));
 	const isCancelled = typeof opts.isCancelled === "function" ? opts.isCancelled : () => false;
 	const task = pdfjsLib.getDocument({
 		data,
@@ -92,8 +83,6 @@ async function renderPdf(data: Uint8Array, opts: ContentRenderOptions, onPage: (
 	let failure: unknown = null;
 	const cancelled = () => failure || isCancelled();
 
-	// Each lane owns one canvas and pulls page numbers from a shared counter, so
-	// worker-side parsing, main-thread painting and JPEG encoding overlap across pages.
 	async function lane() {
 		const canvas = document.createElement("canvas");
 		const ctx = canvas.getContext("2d", { alpha: false })!;
@@ -114,16 +103,12 @@ async function renderPdf(data: Uint8Array, opts: ContentRenderOptions, onPage: (
 					// (rAF is throttled in hidden frames, which made rendering crawl).
 					await page.render({ canvas, canvasContext: ctx, viewport, intent: "print", background: "#ffffff" }).promise;
 					const jpeg = await encodeJpeg(canvas, quality, maxBytes);
-					const b64 = await blobToBase64(jpeg.blob);
+					const b64 = await blobToBase64(jpeg);
 					if (cancelled()) return;
 					rendered++;
 					await onPage({
 						page: i,
 						pageCount: total,
-						width: jpeg.width,
-						height: jpeg.height,
-						bytes: jpeg.blob.size,
-						quality: jpeg.quality,
 						jpegB64: b64,
 					});
 				}
@@ -150,4 +135,4 @@ async function renderPdf(data: Uint8Array, opts: ContentRenderOptions, onPage: (
 	return { rendered, total };
 }
 
-window.TopKRenderer = { version: 2, renderPdf };
+window.TopKRenderer = { renderPdf };

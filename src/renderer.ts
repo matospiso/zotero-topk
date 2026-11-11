@@ -1,25 +1,6 @@
-import { delay } from "./prefs";
+import { delay, withTimeout } from "../shared/async";
+import type { RenderOptions, RenderedPage, RenderResult } from "../shared/rendering";
 import { log, logError, debug, errorMessage } from "./log";
-
-export interface RenderedPage {
-	page: number;
-	pageCount: number;
-	width: number;
-	height: number;
-	bytes: number;
-	quality: number;
-	jpegB64: string;
-}
-
-export interface RenderOptions {
-	maxEdge: number;
-	quality: number; // 1-100
-	maxBytes: number;
-	maxPages: number;
-	maxFileBytes: number;
-	concurrency?: number;
-	signal?: { cancelled: boolean };
-}
 
 const RENDERER_URL = "resource://zotero-topk/content/renderer.html";
 // Gecko sandbox flags (same values Zotero's HiddenBrowser uses)
@@ -101,14 +82,14 @@ export class Renderer {
 		}
 	}
 
-	async renderPdf(path: string, opts: RenderOptions, onPage: (p: RenderedPage) => Promise<void> | void) {
+	async renderPdf(path: string, opts: RenderOptions, onPage: (p: RenderedPage) => Promise<void> | void): Promise<RenderResult> {
 		await this.checkSize(path, opts.maxFileBytes);
 		const api = await this.getApi();
 		const cw = this.contentWindow();
 		if (!cw) throw new Error("renderer frame is gone");
 		const Cu = Components.utils;
 		const bytes = await IOUtils.read(path);
-		const { signal, ...plain } = opts;
+		const { signal, maxFileBytes, ...plain } = opts;
 		const data = Cu.cloneInto(bytes, cw);
 		const contentOpts = Cu.cloneInto({ ...plain, isCancelled: () => !!signal?.cancelled }, cw, { cloneFunctions: true });
 		// The callback runs with chrome privileges but only copies plain values out of the content
@@ -118,10 +99,6 @@ export class Renderer {
 			const page: RenderedPage = {
 				page: Number(p.page),
 				pageCount: Number(p.pageCount),
-				width: Number(p.width),
-				height: Number(p.height),
-				bytes: Number(p.bytes),
-				quality: Number(p.quality),
 				jpegB64: String(p.jpegB64),
 			};
 			return new cw.Promise((resolve: (v?: unknown) => void, reject: (e: unknown) => void) => {
@@ -135,7 +112,7 @@ export class Renderer {
 		return { rendered: Number(result.rendered), total: Number(result.total) };
 	}
 
-	async renderHtml(path: string, opts: RenderOptions, onPage: (p: RenderedPage) => Promise<void> | void) {
+	async renderHtml(path: string, opts: RenderOptions, onPage: (p: RenderedPage) => Promise<void> | void): Promise<RenderResult> {
 		await this.checkSize(path, opts.maxFileBytes);
 		const tmpDir = Zotero.getTempDirectory().path;
 		const pdfPath = PathUtils.join(tmpDir, `topk-${Zotero.Utilities.randomString(8)}.pdf`);
@@ -158,7 +135,6 @@ export class Renderer {
 			browser.browsingContext.sandboxFlags |= SANDBOXED_ORIGIN | SANDBOXED_SCRIPTS;
 			const ok = await browser.load(fileURI);
 			if (!ok) throw new Error(`could not load ${fileURI} for printing`);
-			const printTimeout = delay(180000).then(() => { throw new Error("printing the snapshot timed out"); });
 			// Give layout and local images a moment to settle.
 			await delay(750);
 			const Ci = Components.interfaces;
@@ -186,7 +162,7 @@ export class Renderer {
 				headerStrLeft: "", headerStrCenter: "", headerStrRight: "",
 				footerStrLeft: "", footerStrCenter: "", footerStrRight: "",
 			});
-			await Promise.race([browser.browsingContext.print(settings), printTimeout]);
+			await withTimeout(browser.browsingContext.print(settings), 180000, () => new Error("printing the snapshot timed out"));
 			if (!(await IOUtils.exists(pdfPath))) throw new Error("printing produced no PDF");
 			log(`printed snapshot to ${pdfPath}`);
 		}

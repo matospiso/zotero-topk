@@ -1,6 +1,8 @@
-import { Bridge, SearchHit } from "./bridge";
+import { Bridge } from "./bridge";
+import type { SearchHit } from "../shared/protocol";
 import { PLUGIN_ID, getPref } from "./prefs";
 import { log, logError, errorMessage } from "./log";
+import { selectedLibraryIDs } from "./library";
 
 export const SEARCH_MODE = "topk";
 export const SCORE_COLUMN = "topkScore";
@@ -20,11 +22,6 @@ export interface ItemResult {
 	hits: PageHit[];
 }
 
-/**
- * Adds a "TopK semantic (pages)" mode to Zotero's quick search. In that mode the
- * typed text is sent to TopK, the items list is filtered to the matching items
- * and sorted by a "TopK score" column; the per-page hits feed the item pane section.
- */
 export class SearchIntegration {
 	public results = new Map<number, ItemResult>();        // by (parent) item ID
 	public byAttachment = new Map<number, PageHit[]>();     // by attachment item ID
@@ -83,10 +80,6 @@ export class SearchIntegration {
 		return score.toFixed(3).padStart(8, " ");
 	}
 
-	// ----------------------------------------------------------------------
-	// Per-window wiring
-	// ----------------------------------------------------------------------
-
 	attachWindow(win: any) {
 		const doc = win.document;
 		const searchBox = doc.getElementById("zotero-tb-search");
@@ -143,10 +136,6 @@ export class SearchIntegration {
 		void this.clear(win);
 	}
 
-	// ----------------------------------------------------------------------
-	// Searching
-	// ----------------------------------------------------------------------
-
 	private spinner(win: any, on: boolean) {
 		const spinner = win.document.getElementById("zotero-tb-search-spinner");
 		if (!spinner) return;
@@ -174,12 +163,8 @@ export class SearchIntegration {
 		if (!immediate && text.length < 3) return;
 		this.spinner(win, true);
 		try {
-			let libraryIDs: number[] = [];
-			try { libraryIDs = pane.getSelectedLibraryIDs?.() ?? []; } catch (e) {}
-			if (!libraryIDs.length) {
-				try { libraryIDs = [pane.getSelectedLibraryID()]; } catch (e) {}
-			}
-			const limit = getPref<number>("resultLimit", 60);
+			const libraryIDs = selectedLibraryIDs(pane);
+			const limit = getPref("resultLimit");
 			const hits = await this.bridge.search(text, { limit, libraryIDs });
 			if (seq !== this.seq) return; // superseded by newer input
 			this.lastQuery = text;

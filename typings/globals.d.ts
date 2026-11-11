@@ -6,7 +6,6 @@ declare const Components: any;
 declare const IOUtils: any;
 declare const PathUtils: any;
 declare const rootURI: string;
-declare const pluginID: string;
 declare const pluginVersion: string;
 declare const __DEV__: boolean;
 

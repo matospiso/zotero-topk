@@ -15,3 +15,15 @@ export function localLibraryID(key: string): number | undefined {
 	return Zotero.Libraries.getAll().find((library: any) =>
 		library.libraryType !== "feed" && libraryKey(library.libraryID) === key)?.libraryID;
 }
+
+/** Zotero versions expose either a multiple-library or single-library selection API. */
+export function selectedLibraryIDs(pane: any): number[] {
+	try {
+		const ids = pane.getSelectedLibraryIDs?.();
+		if (ids?.length) return ids;
+	} catch {}
+	try {
+		const id = pane.getSelectedLibraryID();
+		return id === undefined || id === null ? [] : [id];
+	} catch { return []; }
+}
