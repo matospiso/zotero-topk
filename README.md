@@ -27,7 +27,7 @@ search sends your text to TopK and gets back the best matching pages.
 ## Architecture
 
 ```
-Zotero (Gecko)                                   Node.js helper (bridge/server.js)
+Zotero (Gecko)                                   Node.js helper (bridge/server.ts)
 ┌──────────────────────────────┐   localhost     ┌──────────────────────────────┐
 │ indexer ─► renderer          │  HTTP + token   │  topk-js (official JS SDK)   │
 │   PDF  → Zotero's pdf.js     │ ──────────────► │  collection "zotero-pages"   │
@@ -42,7 +42,8 @@ cannot load. The plugin therefore starts a tiny helper process with Node.js
 from the shipped lockfile (`npm ci --ignore-scripts`) into
 `<Zotero data dir>/topk-bridge/` on first run, and talks to it over
 `127.0.0.1` with a per‑session random bearer token. All TopK reads and writes
-go through the SDK in that process.
+go through the SDK in that process. The build compiles the helper and Zotero
+entry points from TypeScript to JavaScript; end users do not need TypeScript or tsx.
 
 Page rendering happens in a content‑privileged `<browser>` loaded from
 `resource://zotero-topk/` with the plugin's own bundled copy of pdf.js, so a
@@ -103,29 +104,33 @@ moves it from its local identity to its synced user identity.
 
 ## Development
 
+Use Node.js 22 and the `zip`/`unzip` tools for development. TypeScript scripts run
+through `tsx`; the packaged helper remains compatible with Node.js 18+.
+
 Each pull request runs the regression suite, type checks, and builds an installable
 XPI. Open its **Test and build XPI** check and use the download link in the run
 summary (GitHub sign-in required; builds are retained for 30 days).
 
 ```sh
-npm install
+npm ci
+npm ci --prefix bridge --ignore-scripts
 npm test                 # deterministic failure/race regression tests
 npm run typecheck
 npm run build            # → build/addon + build/zotero-topk-<version>.xpi
 export ZOTERO_BIN=/path/to/zotero
 npm start                # dev build + launch Zotero with a throwaway profile (.zotero-dev/)
-node scripts/run-zotero.mjs --headless --fake   # in-memory fake backend, no API key needed
+npx tsx scripts/run-zotero.ts --headless --fake   # in-memory fake backend, no API key needed
 npm run e2e              # headless end-to-end test with the fake backend
-node scripts/e2e.mjs --real --collection zotero-e2e              # against TopK (key from .env or TOPK_API_KEY)
-node scripts/e2e.mjs --real --region strawberry --host topk.dev    # against a dev deployment
-node scripts/release.mjs                                           # release xpi + update.json with sha256
+npx tsx scripts/e2e.ts --real --collection zotero-e2e              # against TopK (key from .env or TOPK_API_KEY)
+npx tsx scripts/e2e.ts --real --region strawberry --host topk.dev    # against a dev deployment
+npx tsx scripts/release.ts                                           # release xpi + update.json with sha256
 ```
 
 Keep the API key in `.env` (git‑ignored, `chmod 600`) or in the environment;
 the scripts reject `--apikey` so keys are never accepted on a command line.
 The fake backend and self-test entry point are available only in development builds.
 
-`scripts/e2e.mjs` imports a PDF and an HTML snapshot, waits for indexing,
+`scripts/e2e.ts` imports a PDF and an HTML snapshot, waits for indexing,
 searches through the real quick‑search code path, checks the item pane data,
 and verifies within a bounded timeout that trashing an attachment removes both
 its local state and all of its remote pages. It reads
@@ -137,10 +142,11 @@ hit of each as `q<i>.jpg` in the e2e output directory.
 ### Layout
 
 ```
-addon/      manifest, bootstrap, preferences pane, hidden renderer frame, icons, locale
+addon/      TypeScript bootstrap/preferences/renderer, manifest, icons, locale
 src/        plugin code (TypeScript, bundled by esbuild into addon/content/zotero-topk.js)
 bridge/     Node.js helper that wraps topk-js (copied to the Zotero data dir at runtime)
-scripts/    build, dev launcher, headless e2e
+shared/     typed page and request contracts
+scripts/    TypeScript build, dev launcher, headless e2e
 test/       fixtures and probe queries
 ```
 
@@ -175,7 +181,7 @@ test/       fixtures and probe queries
 
 ## Releasing
 
-`node scripts/release.mjs` builds the xpi and writes `update.json` with the
+`npx tsx scripts/release.ts` builds the xpi and writes `update.json` with the
 asset URL of the matching GitHub release and the xpi's `sha256` as
 `update_hash`. Commit `update.json`, tag `v<version>`, create the release and
 upload the xpi; Zotero verifies the hash before installing an update. Keep

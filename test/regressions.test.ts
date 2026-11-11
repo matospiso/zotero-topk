@@ -1,26 +1,34 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
+import test, { type TestContext } from 'node:test';
 import { build } from 'esbuild';
+import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, statSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import vm from 'node:vm';
 import path from 'node:path';
 
-const bundle = (await build({ stdin: { contents: `export * from './src/indexer'; export * from './src/bridge'; export * from './src/search'; export * from './src/itemPane'; export * from './src/addon'; export * from './src/library'; export * from './src/selftest';`, resolveDir: process.cwd() }, bundle: true, write: false, format: 'cjs', platform: 'node', define: { __DEV__: 'false' } })).outputFiles[0].text;
-const backendContext = vm.createContext({ require: createRequire(new URL('../bridge/server.js', import.meta.url)), process: { env: { TOPK_BRIDGE_TOKEN: 'x'.repeat(32) } }, console, Buffer, setTimeout });
-vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('const backend = FAKE')[0] + '\nglobalThis.FakeBackend = FakeBackend; globalThis.TopKBackend = TopKBackend; globalThis.scheduled = scheduled; globalThis.SCOPE = SCOPE;', backendContext);
-const defer = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
+import * as backendModule from '../bridge/server';
+// SDK and Zotero mocks intentionally expose internals so failure paths can be injected.
+const backendContext: any = backendModule;
+async function bundleAPI(dev = false) {
+ const result = await build({ entryPoints: ['test/plugin-api.ts'], bundle: true, platform: 'browser', format: 'cjs', write: false, define: { __DEV__: String(dev) } });
+ return result.outputFiles[0].text;
+}
+const bundle = await bundleAPI();
+const defer = <T = void>() => {
+ let resolve!: (value: T | PromiseLike<T>) => void, reject!: (reason?: unknown) => void;
+ const promise = new Promise<T>((a, b) => { resolve = a; reject = b; });
+ return { promise, resolve, reject };
+};
 const tick = () => new Promise((r) => setImmediate(r));
 async function until(predicate) { for (let i = 0; i < 1000; i++) { if (predicate()) return; await tick(); } throw new Error('condition did not become true'); }
 
-async function harness(t, { backend = new backendContext.FakeBackend(), files = new Map(), groupLocalID = 2 } = {}) {
- const prefs = new Map(Object.entries({ apiKey: 'account-a', region: 'test', host: '', collection: 'pages', bridgeFake: true, uploadBatch: 1, autoIndex: false }).map(([k,v]) => ['extensions.zotero-topk.' + k,v]));
+async function harness(t: TestContext, { backend = new backendContext.FakeBackend(), files = new Map<string, string>(), groupLocalID = 2, subprocess = {} }: { backend?: any; files?: Map<string, string>; groupLocalID?: number; subprocess?: any } = {}) {
+ const prefs = new Map<string, any>(Object.entries({ apiKey: 'account-a', region: 'test', host: '', collection: 'pages', bridgeFake: true, uploadBatch: 1, autoIndex: false }).map(([k,v]) => ['extensions.zotero-topk.' + k,v]));
  const observers = new Map(); const timers = new Map(); const items = new Map();
  const libraries = [{ libraryID: 1, libraryType: 'user' }, { libraryID: groupLocalID, libraryType: 'group' }];
- const Zotero = {
+ const Zotero: any = {
   Prefs: { get: (k) => prefs.get(k), set(k, v) { prefs.set(k,v); for (const [name, fn] of observers.values()) if (name === k) fn(v); }, registerObserver(k, fn) { const id = {}; observers.set(id,[k,fn]); return id; }, unregisterObserver: (id) => observers.delete(id) },
   Libraries: { userLibraryID: 1, get: (id) => libraries.find((l) => l.libraryID === id), getAll: () => libraries },
   Users: { getCurrentUserID: () => 17, getLocalUserKey: () => 'localABC' }, Groups: { getGroupIDFromLibraryID: () => 42 },
@@ -31,17 +39,18 @@ async function harness(t, { backend = new backendContext.FakeBackend(), files = 
   ItemPaneManager: { registerSection: (opts) => { Zotero.section = opts; return 'section'; }, unregisterSection() {} },
   Search: class { addCondition() {} },
  };
- const context = vm.createContext({ module: { exports: {} }, Zotero, ChromeUtils: { importESModule: () => ({}) }, PathUtils: path,
+ const context = vm.createContext({ module: { exports: {} }, Zotero, ChromeUtils: { importESModule: () => ({ Subprocess: subprocess }) }, PathUtils: path,
+  Services: { env: { get: (key) => key === 'HOME' ? '/mock/home' : '' } },
   IOUtils: { exists: async (p) => files.has(p), readUTF8: async (p) => files.get(p), writeUTF8: async (p, v) => { files.set(p,v); }, computeHexDigest: async () => 'hash' },
   setTimeout(fn, ms) { const timer = setTimeout(fn, ms); timers.set(timer, { fn, ms }); return timer; },
   clearTimeout(timer) { timers.delete(timer); clearTimeout(timer); },
  });
  vm.runInContext(bundle, context);
- const api = context.module.exports; const bridge = new api.Bridge('', 'test'); const requests = [];
+ const api: any = context.module.exports; const bridge = new api.Bridge('', 'test'); const requests: Array<{ route: string; body: any }> = [];
  bridge.ensureRunning = async () => {};
- const handlers = { '/configure': 'configure', '/status': 'status', '/upsert': 'upsert', '/manifest': 'manifest', '/delete': 'deleteAttachments', '/delete-library': 'deleteLibrary', '/search': 'search', '/images': 'images', '/attachment-status': 'hasAttachment' };
+ const handlers: Record<string, string> = { '/configure': 'configure', '/status': 'status', '/upsert': 'upsert', '/manifest': 'manifest', '/delete': 'deleteAttachments', '/delete-library': 'deleteLibrary', '/search': 'search', '/images': 'images', '/attachment-status': 'hasAttachment' };
  bridge.request = async (_method, route, body) => { requests.push({ route, body }); return backend[handlers[route]](body); };
- const renderer = { calls: 0, destroy() {}, async renderPdf(_path, opts, onPage) { this.calls++; const count = Math.min(3, opts.maxPages); for (let page = 1; page <= count; page++) await onPage({ page, pageCount: 3, jpegB64: 'aW1hZ2U=' }); return { rendered: count, total: 3 }; } };
+ const renderer: any = { calls: 0, destroy() {}, async renderPdf(_path, opts, onPage) { this.calls++; const count = Math.min(3, opts.maxPages); for (let page = 1; page <= count; page++) await onPage({ page, pageCount: 3, jpegB64: 'aW1hZ2U=' }); return { rendered: count, total: 3 }; } };
  renderer.renderHtml = (...args) => renderer.renderPdf(...args);
  const indexer = new api.Indexer(bridge, renderer); await indexer.start();
  t.after(async () => { indexer.stop(); await indexer.writes; for (const timer of timers.keys()) clearTimeout(timer); });
@@ -164,7 +173,7 @@ test('destination changes during upload neither redirect it nor adopt its state'
 });
 
 test('leaving TopK mode invalidates the first pending search', async (t) => {
- const h = await harness(t); const item = h.addItem(); const gate = defer(); const filters = [];
+ const h = await harness(t); const item = h.addItem(); const gate = defer<any[]>(); const filters: unknown[] = [];
  const win = { document: { getElementById: (id) => id === 'zotero-tb-search' ? { searchTextbox: { value:'query' } } : null }, ZoteroPane: { getSelectedLibraryIDs: () => [1], itemsView: { setFilter: async (...args) => filters.push(args) } } };
  h.Zotero.getMainWindows = () => [win]; h.Zotero.Prefs.set('search.quicksearch-mode','topk');
  const search = new h.SearchIntegration({ search: () => gate.promise }); search.install();
@@ -193,7 +202,7 @@ test('destroying item pane bodies removes their callbacks and unregister clears 
 for (const [label, local, remote] of [['local state remains', true, false], ['remote pages remain', false, true], ['bridge never responds', false, null]]) {
  test(`deletion self-test fails when ${label}`, async (t) => {
   const h = await harness(t);
-  const addon = { indexer: { getState: () => local ? {} : undefined }, bridge: { hasAttachment: () => remote === null ? new Promise(() => {}) : Promise.resolve(remote) } };
+  const addon = { indexer: { getState: () => local ? {} : undefined }, bridge: { hasAttachment: () => remote === null ? new Promise<never>(() => {}) : Promise.resolve(remote) } };
   await assert.rejects(h.verifyRemoval(addon, { libraryID:1, key:'ABCDEFGH' }, 10), /removal timed out/);
  });
 }
@@ -205,7 +214,7 @@ test('deletion self-test passes only when local state and all remote pages are a
 });
 
 test('backend request ordering is scoped: uploads overlap, deletions wait for their attachment, configure waits for all', async () => {
- const { scheduled, SCOPE } = backendContext; const gate = defer(); const order = [];
+ const { scheduled, SCOPE } = backendContext; const gate = defer(); const order: string[] = [];
  const upload = scheduled(SCOPE.upload, async ({ docs }) => { order.push(`upload ${docs[0].attachment_key} started`); await gate.promise; order.push(`upload ${docs[0].attachment_key} finished`); });
  const remove = scheduled(SCOPE.attachments, async ({ attachmentKeys }) => { order.push(`deleted ${attachmentKeys.join()}`); });
  const removeLibrary = scheduled(SCOPE.library, async ({ libraryKey }) => { order.push(`deleted ${libraryKey}`); });
@@ -275,7 +284,7 @@ test('reindexing the same attachment waits for its previous completion record', 
 
 test('uploadConcurrency bounds uploads across both pipelined attachments including commit records', async (t) => {
  const h = await harness(t); h.setPref('uploadConcurrency', 2);
- const gates = []; let active = 0, peak = 0;
+ const gates: ReturnType<typeof defer<void>>[] = []; let active = 0, peak = 0;
  const original = h.backend.upsert.bind(h.backend);
  h.backend.upsert = async (body) => {
   const gate = defer(); gates.push(gate); active++; peak = Math.max(peak, active);
@@ -314,14 +323,12 @@ test('a draining document timeout does not destroy the next document renderer', 
 });
 
 test('helper read routes wait for configure and configure drains abandoned reads', async () => {
- const context = vm.createContext({ require: createRequire(new URL('../bridge/server.js', import.meta.url)),
-  process: { env: { TOPK_BRIDGE_TOKEN: 'x'.repeat(32), TOPK_BRIDGE_FAKE: '1' } }, console, Buffer, setTimeout });
- vm.runInContext(readFileSync('bridge/server.js', 'utf8').split('function readBody')[0]
-  + '\nglobalThis.routes = ROUTES; globalThis.backend = backend;', context);
+ const backend = new backendContext.FakeBackend();
+ const context: any = { backend, routes: backendModule.createRoutes(backend) };
  const reads = [['GET /status', 'status'], ['POST /search', 'search'], ['POST /images', 'images'],
   ['POST /manifest', 'manifest'], ['POST /attachment-status', 'hasAttachment']];
  for (const [route, method] of reads) {
-  const readGate = defer(), configGate = defer(), order = [];
+  const readGate = defer(), configGate = defer(), order: string[] = [];
   context.backend[method] = async () => { order.push('read'); await readGate.promise; };
   context.backend.configure = async () => { order.push('configure'); await configGate.promise; };
   const before = context.routes[route]({}); await tick();
@@ -334,7 +341,7 @@ test('helper read routes wait for configure and configure drains abandoned reads
 });
 
 test('out-of-order upload responses keep the newest read fence without rounding u64 LSNs', async () => {
- const backend = new backendContext.TopKBackend(); const older = defer(), newer = defer();
+ const backend = new backendContext.TopKBackend(); const older = defer<string>(), newer = defer<string>();
  backend._sdk = () => ({ data: { image: (data) => ({ data }) } });
  backend.client = { collection: () => ({ upsert: (docs) => docs[0]._id === 'old' ? older.promise : newer.promise }) };
  const first = backend.upsert({ docs: [{ _id: 'old', page_image_b64: 'aW1hZ2U=' }] });
@@ -347,13 +354,14 @@ test('out-of-order upload responses keep the newest read fence without rounding 
 
 test('real backend uses stable scopes and completion markers, including partial-page deletion', async () => {
  const backend = new backendContext.TopKBackend();
- const documents = new Map(); const reads = [];
+ const documents = new Map(); const reads: any[] = [];
  class Expression {
-  constructor(matches) { this.matches = matches; }
+  matches: (doc: any) => boolean;
+  constructor(matches: (doc: any) => boolean) { this.matches = matches; }
   and(other) { return new Expression((doc) => this.matches(doc) && other.matches(doc)); }
  }
  const field = (key) => ({ key, eq: (v) => new Expression((d) => d[key] === v), gt: (v) => new Expression((d) => d[key] > v), in: (vs) => new Expression((d) => vs.includes(d[key])) });
- const select = (fields) => ({ fields, filter(expr) { this.expr = expr; return this; }, sort(f, ascending) { this.sortField = f.key; this.ascending = ascending; return this; }, limit(n) { this.count = n; return this; } });
+ const select = (fields): any => ({ fields, filter(expr) { this.expr = expr; return this; }, sort(f, ascending) { this.sortField = f.key; this.ascending = ascending; return this; }, limit(n) { this.count = n; return this; } });
  backend._sdk = () => ({ query: { select, field }, data: { image: (data) => ({ data }) } });
  backend.client = { collection: () => ({
   query: async (q, options) => {
@@ -369,7 +377,7 @@ test('real backend uses stable scopes and completion markers, including partial-
  documents.set('legacy', { library_id:2, attachment_key:'C', page:1, page_count:20 });
  documents.set('foreign', { library_id:2, library_key:'group:99', attachment_key:'A', page:1, indexed_pages:2 });
  const result = await backend.manifest({ libraryKey:'group:42' });
- assert.deepEqual(Array.from(result.rows, (r) => r.attachment_key), ['A']);
+ assert.deepEqual(Array.from(result.rows, (r: any) => r.attachment_key), ['A']);
  assert.equal((await backend.hasAttachment({ libraryKey:'group:42', attachmentKey:'B' })).exists,true);
  await backend.deleteAttachments({ libraryKey:'group:42', attachmentKeys:['A','B'] });
  assert.equal(documents.size,2); assert.equal(documents.has('foreign'),true); assert.equal(documents.has('legacy'),true);
@@ -404,9 +412,9 @@ test('release builds ignore the fake-backend preference and still require creden
 });
 
 test('development builds retain the fake backend', async () => {
- const output = await build({ entryPoints:['src/bridge.ts'], bundle:true, write:false, format:'cjs', platform:'node', define:{ __DEV__:'true' } });
+ const output = await bundleAPI(true);
  const context = vm.createContext({ module:{ exports:{} }, ChromeUtils:{ importESModule:() => ({}) }, Zotero:{ Prefs:{ get:(name) => name === 'extensions.zotero-topk.bridgeFake' ? true : undefined } } });
- vm.runInContext(output.outputFiles[0].text,context);
+ vm.runInContext(output,context);
  assert.equal(context.module.exports.destination().fake,true);
 });
 
@@ -429,10 +437,10 @@ for (const kind of ['real','fake']) test(`${kind} image responses stay below 8 M
  assert.equal(result.images['image-0'].b64,bytes.toString('base64'));
 });
 
-for (const script of ['e2e.mjs','run-zotero.mjs']) test(`${script} rejects command-line API keys without echoing them`, () => {
+for (const script of ['e2e.ts','run-zotero.ts']) test(`${script} rejects command-line API keys without echoing them`, () => {
  const secret = 'never-provisioned-test-key';
  for (const args of [['--apikey',secret],[`--apikey=${secret}`]]) {
-  const result = spawnSync(process.execPath,[`scripts/${script}`,...args], { encoding:'utf8' });
+  const result = spawnSync(process.execPath,["--import", "tsx", `scripts/${script}`,...args], { encoding:'utf8' });
   assert.ifError(result.error);
   assert.equal(result.status,2);
   assert.match(result.stderr,/use TOPK_API_KEY/);
@@ -445,7 +453,7 @@ test('dev launcher tightens existing profile and credential-file permissions', {
  t.after(() => rmSync(dir,{ recursive:true, force:true }));
  const profile = path.join(dir,'profile'); const userPrefs = path.join(profile,'user.js');
  mkdirSync(profile); chmodSync(profile,0o777); writeFileSync(userPrefs,'old preferences'); chmodSync(userPrefs,0o666);
- const result = spawnSync(process.execPath,['scripts/run-zotero.mjs','--dev-dir',dir], {
+ const result = spawnSync(process.execPath,['--import','tsx','scripts/run-zotero.ts','--dev-dir',dir], {
   env:{ ...process.env, ZOTERO_BIN:'/bin/true', TOPK_API_KEY:'never-provisioned-test-key' }, encoding:'utf8',
  });
  assert.ifError(result.error);
@@ -454,3 +462,4 @@ test('dev launcher tightens existing profile and credential-file permissions', {
  assert.equal(statSync(userPrefs).mode & 0o777,0o600);
  assert.ok(readFileSync(userPrefs,'utf8').includes('never-provisioned-test-key'));
 });
+

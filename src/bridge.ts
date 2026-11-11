@@ -2,40 +2,8 @@ import { getPref, delay } from "./prefs";
 import { libraryKey, localLibraryID } from "./library";
 import { log, logError, errorMessage, debug } from "./log";
 
-export interface SearchHit {
-	_id: string;
-	library_id: number;
-	library_key: string;
-	attachment_key: string;
-	item_key: string;
-	page: number;
-	page_count: number;
-	title: string;
-	score: number;
-}
-
-export interface PageDoc {
-	indexed_pages?: number;
-	_id: string;
-	library_id: number;
-	library_key: string;
-	attachment_key: string;
-	item_key: string;
-	page: number;
-	page_count: number;
-	title: string;
-	file_hash: string;
-	page_image_b64: string;
-}
-
-export interface ManifestRow {
-	indexed_pages: number;
-	attachment_key: string;
-	library_id: number;
-	library_key: string;
-	file_hash: string;
-	page_count: number;
-}
+import type { SearchHit, PageDoc, ManifestRow } from "../shared/protocol";
+export type { SearchHit, PageDoc, ManifestRow } from "../shared/protocol";
 
 export function destination() {
 	return {

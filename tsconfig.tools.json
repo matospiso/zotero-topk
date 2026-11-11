@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": [
+      "node"
+    ],
+    "lib": [
+      "es2022",
+      "dom"
+    ],
+    "allowImportingTsExtensions": true,
+    "noImplicitAny": true
+  },
+  "include": [
+    "bridge",
+    "scripts",
+    "shared"
+  ],
+  "exclude": []
+}

@@ -26,7 +26,7 @@ export async function verifyRemoval(addon: Pick<TopKAddon, "bridge" | "indexer">
 }
 
 /**
- * Development-only end-to-end check, driven by scripts/e2e.mjs:
+ * Development-only end-to-end check, driven by scripts/e2e.ts:
  * imports fixture attachments, waits for indexing, runs a search through the
  * real quick-search code path, writes a JSON report and quits Zotero.
  */

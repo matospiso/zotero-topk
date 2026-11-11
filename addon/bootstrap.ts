@@ -1,7 +1,8 @@
 /* global Components, Services, Zotero, APP_SHUTDOWN, ADDON_UNINSTALL */
 "use strict";
 
-var chromeHandle = null;
+var chromeHandle: { destruct(): void } | null = null;
+interface AddonData { id: string; version: string; rootURI: string }
 const RESOURCE_HOST = "zotero-topk";
 const PREF_KEYS = [
 	"apiKey", "region", "host", "collection", "nodePath", "autoIndex", "indexSnapshots", "maxPages", "maxEdge",
@@ -20,7 +21,7 @@ function install() {}
  * the helper directory (with its node_modules) and the plugin's preferences,
  * including the API key.
  */
-async function uninstall({ id, version, rootURI }, reason) {
+async function uninstall({ id, version, rootURI }: AddonData, reason: number) {
 	if (typeof ADDON_UNINSTALL !== "undefined" && reason !== ADDON_UNINSTALL) return;
 	try {
 		const dataDir = Zotero.DataDirectory.dir;
@@ -36,7 +37,7 @@ async function uninstall({ id, version, rootURI }, reason) {
 	}
 }
 
-async function startup({ id, version, rootURI }, reason) {
+async function startup({ id, version, rootURI }: AddonData, reason: number) {
 	const aomStartup = Components.classes["@mozilla.org/addons/addon-manager-startup;1"]
 		.getService(Components.interfaces.amIAddonManagerStartup);
 	const manifestURI = Services.io.newURI(rootURI + "manifest.json");
@@ -53,15 +54,15 @@ async function startup({ id, version, rootURI }, reason) {
 	await Zotero.TopK.startup({ id, version, rootURI, reason });
 }
 
-function onMainWindowLoad({ window }) {
+function onMainWindowLoad({ window }: { window: Window }) {
 	Zotero.TopK?.onMainWindowLoad(window);
 }
 
-function onMainWindowUnload({ window }) {
+function onMainWindowUnload({ window }: { window: Window }) {
 	Zotero.TopK?.onMainWindowUnload(window);
 }
 
-async function shutdown({ id, version, rootURI }, reason) {
+async function shutdown({ id, version, rootURI }: AddonData, reason: number) {
 	if (reason === APP_SHUTDOWN) {
 		// Still make sure the helper process doesn't outlive Zotero.
 		try { Zotero.TopK?.onAppShutdown(); } catch (e) {}

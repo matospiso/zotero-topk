@@ -1,6 +1,6 @@
 // Launches Zotero with a throwaway profile that loads the plugin from build/addon.
 //
-//   node scripts/run-zotero.mjs [--headless] [--fake] [--selftest out.json] [--data DIR] [--profile DIR]
+//   npx tsx scripts/run-zotero.ts [--headless] [--fake] [--selftest out.json] [--data DIR] [--profile DIR]
 //
 // Set ZOTERO_BIN to your Zotero executable (Linux: .../zotero, macOS: Zotero.app/Contents/MacOS/zotero).
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, chmodSync } from "node:fs";
@@ -14,8 +14,8 @@ if (args.some((arg) => arg === "--apikey" || arg.startsWith("--apikey="))) {
 	console.error("--apikey is no longer supported; use TOPK_API_KEY in the environment instead.");
 	process.exit(2);
 }
-const flag = (name) => args.includes(name);
-const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
+const flag = (name: string) => args.includes(name);
+const opt = (name: string, def = "") => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
 
 const zoteroBin = process.env.ZOTERO_BIN || opt("--zotero");
 if (!zoteroBin || !existsSync(zoteroBin)) {
@@ -59,7 +59,7 @@ if (existsSync(prefsFile)) {
 	writeFileSync(prefsFile, readFileSync(prefsFile, "utf8").split("\n")
 		.filter((l) => !/extensions\.lastAppBuildId|extensions\.lastAppVersion/.test(l)).join("\n"));
 }
-const prefs = {
+const prefs: Record<string, string | boolean | number> = {
 	"extensions.zotero.firstRun2": false,
 	"extensions.zotero.firstRunGuidance": false,
 	"extensions.zotero.dataDir": data,
@@ -84,7 +84,7 @@ if (apiKey) prefs["extensions.zotero-topk.apiKey"] = apiKey;
 if (opt("--collection")) prefs["extensions.zotero-topk.collection"] = opt("--collection");
 if (opt("--region")) prefs["extensions.zotero-topk.region"] = opt("--region");
 if (opt("--host")) prefs["extensions.zotero-topk.host"] = opt("--host");
-if (opt("--node")) prefs["extensions.zotero-topk.nodePath"] = opt("--node");
+prefs["extensions.zotero-topk.nodePath"] = opt("--node") || process.execPath;
 const userPrefsPath = join(profile, "user.js");
 // writeFileSync's mode only applies to new files. Tighten an existing profile
 // before writing credentials, and stop if its permissions cannot be changed.
