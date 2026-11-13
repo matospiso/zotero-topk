@@ -13,7 +13,7 @@ inside Zotero. The plugin renders pages as images and uses
 
 ## See it in action
 
-<!-- DEMO_VIDEO: replace with the GitHub user-attachments video link -->
+https://github.com/user-attachments/assets/dd2c39e5-5ddb-4fab-a8eb-22318b8c9e49
 
 *A short demo (about 1.5 minutes).*
 
