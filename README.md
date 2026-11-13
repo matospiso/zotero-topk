@@ -11,6 +11,21 @@ inside Zotero. The plugin renders pages as images and uses
 [Development](docs/development.md) · [Architecture](docs/architecture.md) ·
 [Contributing](CONTRIBUTING.md)
 
+## See it in action
+
+<!-- DEMO_VIDEO: replace with the GitHub user-attachments video link -->
+
+*A short demo (about 1.5 minutes).*
+
+In the video:
+
+1. Pick **TopK semantic (pages)** in Zotero's search bar.
+2. Type what you're looking for in plain words. It doesn't need to match the
+   exact text in the paper.
+3. Zotero lists the papers that fit best, with a **TopK score** for each.
+4. Open a result to see the matching pages, then click a page to jump straight
+   to it in the PDF.
+
 ## Features
 
 - **Page-level search:** a *TopK semantic (pages)* mode in Zotero's search bar,
