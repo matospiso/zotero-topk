@@ -10,8 +10,11 @@ inside Zotero. The plugin renders pages as images and uses
 For example, search for "diagram explaining the reranker architecture", then
 open a matching paper and jump to the relevant PDF page.
 
-> TopK is a paid, hosted service; indexing, storage, and searches incur usage
-> charges. See [current pricing](https://www.topk.io/pricing).
+> TopK includes **$10 in free credits** to get started. Text and image embeddings
+> cost **$0.05 per million input tokens**, and storage costs **$0.10 per GiB per
+> month**. Writes, queries, and data retrieval also incur charges; see
+> [current pricing](https://www.topk.io/pricing).
+>
 > Automatic indexing is enabled by default: connecting can start uploading
 > existing PDFs and snapshots from your personal and group libraries. To choose
 > what gets uploaded, turn it off before entering your API key (see
