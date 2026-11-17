@@ -7,7 +7,18 @@ Search the **pages** of your PDFs and saved web snapshots by meaning, directly
 inside Zotero. The plugin renders pages as images and uses
 [TopK](https://www.topk.io/) to find the pages that match your query.
 
+For example, search for "diagram explaining the reranker architecture", then
+open a matching paper and jump to the relevant PDF page.
+
+> TopK is a paid, hosted service; indexing, storage, and searches incur usage
+> charges. See [current pricing](https://www.topk.io/pricing).
+> Automatic indexing is enabled by default: connecting can start uploading
+> existing PDFs and snapshots from your personal and group libraries. To choose
+> what gets uploaded, turn it off before entering your API key (see
+> [Getting started](#getting-started)).
+
 [Getting started](#getting-started) · [Configuration](docs/configuration.md) ·
+[Privacy](#network-use-and-privacy) ·
 [Development](docs/development.md) · [Architecture](docs/architecture.md) ·
 [Contributing](CONTRIBUTING.md)
 
@@ -47,11 +58,6 @@ In the video:
 Node.js runs the helper and development tooling. The helper uses TopK's native SDK, which cannot load inside Zotero's Gecko
 runtime. See [runtime boundaries](docs/architecture.md#runtime-boundaries).
 
-Pages are uploaded as images to your configured TopK collection. Query text is
-also sent to TopK; this is not an offline search engine. See
-[data handling](docs/architecture.md#security-and-data-handling) before indexing
-private documents.
-
 ## Getting started
 
 1. Download an XPI from [Releases](https://github.com/topk-io/zotero-topk/releases)
@@ -61,13 +67,54 @@ private documents.
    GitHub sign-in and expire after 30 days. You can also [build from source](docs/development.md).
 2. In Zotero, open **Tools → Plugins → ⚙ → Install Plugin From File…** and select
    `zotero-topk-<version>.xpi`.
-3. Open **Settings → TopK Semantic Search**. Enter your API key, region, and
-   collection, then click **Test connection**. The helper installs its pinned SDK
-   on first use.
-4. Existing libraries begin indexing automatically. Select **TopK semantic
-   (pages)** in the search bar's mode menu and enter a query.
+3. Open **Settings → TopK Semantic Search**. To index only attachments you choose,
+   uncheck **Automatically index new PDFs and snapshots** before entering your
+   API key. Leaving it enabled also includes existing attachments in your
+   personal and group libraries; there is no separate upload-consent dialog or
+   cost estimate.
+4. Enter your API key, region, and collection, then click **Test connection**.
+   The helper installs its pinned SDK on first use. If automatic indexing is
+   enabled, a successful connection starts indexing your libraries. Otherwise,
+   select attachments, right-click, and choose **TopK: Index Selected Items**.
+5. Once pages are indexed, select **TopK semantic (pages)** in the search bar's
+   mode menu and enter a query. Open a result's **TopK pages** section and click
+   a page to jump to it in the PDF.
 
 If Node.js cannot be discovered, select its executable in settings.
+
+## Indexing behavior and limits
+
+With automatic indexing enabled, the plugin checks existing libraries at startup
+and indexes new or changed PDF and snapshot attachments. **Index new documents
+now** scans all personal and group libraries, skipping attachments whose content
+has not changed since successful indexing. Rebuilding re-renders and re-uploads
+attachments, incurring usage again. Trashing or deleting attachments in Zotero
+removes their indexed pages; failed remote deletions are queued for retry.
+
+By default, only the first **500 pages per document** are indexed, and attachments
+larger than **200 MB** are skipped. Saved HTML snapshots are rendered as A4 pages.
+Check indexing progress and errors in the plugin's settings; see
+[Configuration](docs/configuration.md) for limits and controls.
+
+## Network use and privacy
+
+The plugin uploads an image of each indexed page to your configured TopK
+collection, together with its title (which can include a filename), Zotero
+library/user/group and item identifiers, page numbers and counts, and a file
+content hash. TopK stores the page images and metadata for search. Query text is
+also sent to TopK. Review what your documents contain before indexing them.
+
+Your API key is stored as a Zotero preference in your local profile. The local
+helper connects to your configured TopK endpoint; on first use it also downloads
+the pinned SDK and platform packages from npm. Zotero checks for plugin updates
+on GitHub. See [data handling](docs/architecture.md#security-and-data-handling)
+for implementation details.
+
+**TopK: Remove Selected Items from Index** removes selected attachments' remote
+entries, but a later indexing run can upload them again. Uninstalling the plugin
+cleans up local settings and index state; it does **not** delete the TopK
+collection. To remove all uploaded data from a collection dedicated to this
+plugin, disable or uninstall the plugin, then delete that collection in TopK.
 
 ## Development
 
