@@ -4,8 +4,9 @@
 
 ## Setup and checks
 
-Use Node.js 22 and npm, and install `zip` and `unzip`. End users only need
-Node.js 18+ to run the packaged helper; development scripts run through `tsx`.
+Use the latest patch of a supported Node.js LTS release (minimum 22.13.0) and npm,
+and install `zip` and `unzip`. The packaged helper has the same Node.js minimum;
+development scripts run through `tsx`.
 
 ```sh
 npm ci
