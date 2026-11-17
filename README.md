@@ -40,10 +40,11 @@ In the video:
 ## Requirements
 
 - **Zotero 7–10.0.x**, matching the versions declared in the plugin manifest.
-- **[Node.js 18+](https://nodejs.org/) and npm** for the local helper process.
+- **[Node.js 22.13.0+](https://nodejs.org/) and npm** for the local helper process.
+  Use the latest patch of a supported LTS release; Node.js 18 and 20 are end-of-life.
 - **[A TopK account and API key](https://console.topk.io/)**, plus network access.
 
-Node.js runs the helper; Node.js 22 is required for development tooling. The helper uses TopK's native SDK, which cannot load inside Zotero's Gecko
+Node.js runs the helper and development tooling. The helper uses TopK's native SDK, which cannot load inside Zotero's Gecko
 runtime. See [runtime boundaries](docs/architecture.md#runtime-boundaries).
 
 Pages are uploaded as images to your configured TopK collection. Query text is
@@ -70,7 +71,7 @@ If Node.js cannot be discovered, select its executable in settings.
 
 ## Development
 
-Install Node.js 22, npm, and the `zip`/`unzip` command-line tools, then:
+Install Node.js 22.13.0 or newer from a supported LTS release, npm, and the `zip`/`unzip` command-line tools, then:
 
 ```sh
 npm ci

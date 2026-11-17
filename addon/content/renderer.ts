@@ -129,7 +129,7 @@ async function renderPdf(data: Uint8Array, opts: ContentRenderOptions, onPage: (
 		await Promise.all(Array.from({ length: Math.min(concurrency, count) }, lane));
 	}
 	finally {
-		await doc.destroy();
+		await task.destroy();
 	}
 	if (failure) throw failure;
 	return { rendered, total };

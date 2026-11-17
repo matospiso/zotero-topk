@@ -24,7 +24,7 @@ for (const file of HELPER_FILES) {
 cpSync(join(root, "LICENSE"), join(addonOut, "LICENSE"));
 await build({
 	entryPoints: [join(root, "bridge/server.ts")], bundle: true,
-	platform: "node", target: "node18", format: "esm", outfile: join(addonOut, "bridge/server.js"),
+	platform: "node", target: "node22", format: "esm", outfile: join(addonOut, "bridge/server.js"),
 	external: ["topk-js", "topk-js/*"],
 });
 
