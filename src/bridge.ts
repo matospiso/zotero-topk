@@ -1,7 +1,7 @@
 import { getPref, getPrefs } from "./prefs";
 import { withTimeout } from "../shared/async";
 import { DESTINATION_PREFS } from "../shared/preferences";
-import { HELPER_FILES } from "../shared/runtime";
+import { HELPER_FILES, MIN_NODE_VERSION, supportsNodeVersion } from "../shared/runtime";
 import { HOST_LABEL, HOST_NAME, COLLECTION_NAME } from "../shared/configuration";
 import { libraryKey, localLibraryID } from "./library";
 import { log, logError, errorMessage, debug } from "./log";
@@ -199,10 +199,8 @@ export class Bridge {
 			let chunk: string;
 			while ((chunk = await proc.stdout.readString())) out += chunk;
 			const { exitCode } = await proc.wait();
-			const m = out.match(/v(\d+)\.(\d+)\.(\d+)/);
-			if (exitCode !== 0 || !m) return null;
-			if (parseInt(m[1], 10) < 18) return null;
-			return m[0];
+			if (exitCode !== 0 || !supportsNodeVersion(out)) return null;
+			return out.trim();
 		}
 		catch (e) {
 			return null;
@@ -260,7 +258,7 @@ export class Bridge {
 			}
 		}
 		throw new BridgeError(
-			"Node.js 18 or newer was not found. Install it from https://nodejs.org and/or set the path in "
+			`Node.js ${MIN_NODE_VERSION} or newer was not found. Install a supported LTS release from https://nodejs.org and/or set the path in `
 			+ "Settings → TopK Semantic Search."
 		);
 	}

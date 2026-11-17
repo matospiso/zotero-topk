@@ -30,6 +30,6 @@
   },
   "homepage": "https://github.com/topk-io/zotero-topk#readme",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   }
 }

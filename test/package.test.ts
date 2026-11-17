@@ -2,7 +2,7 @@ import { after as afterAll, before as beforeAll, test } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { request as httpRequest } from "node:http";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -73,6 +73,23 @@ test("the pinned native TopK SDK loads under Node without credentials or network
 	const client = new sdk.Client({ apiKey: "never-provisioned-test-key", region: "aws-us-east-1-elastica" });
 	assert.notEqual(client.collection("compatibility-probe"), undefined);
 	assert.notEqual(sdk.data.image(readFileSync("addon/content/icons/topk-48.png")), undefined);
+});
+
+test("packaged helper refuses unsupported Node versions before starting", () => {
+	for (const version of ["18.20.8", "20.20.0", "22.12.0"]) {
+		const preload = "data:text/javascript," + encodeURIComponent(
+			`Object.defineProperty(process.versions, 'node', { value: ${JSON.stringify(version)} });`
+		);
+		const result = spawnSync(process.execPath, ["--import", preload, "server.js"], {
+			cwd: join(extracted, "bridge"), encoding: "utf8", timeout: 5000,
+			env: { ...process.env, TOPK_BRIDGE_TOKEN: "test-token-".repeat(4), TOPK_BRIDGE_FAKE: "1" },
+		});
+		assert.ifError(result.error);
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /Node.js 22\.13\.0 or newer is required/);
+		assert.ok(result.stderr.includes(`found ${version}`));
+		assert.ok(!result.stdout.includes(BRIDGE_READY_PREFIX));
+	}
 });
 
 test("production plugin bundle loads as a classic Gecko script and ignores the fake preference", async () => {

@@ -9,6 +9,7 @@ import type { Backend } from "./backend";
 import { createScheduler, SCOPE } from "./scheduler";
 import type { BridgeRoutes, ConfigureRequest, SearchRequest, ImagesRequest, LibraryRequest, AttachmentRequest } from "../shared/protocol";
 import { BRIDGE_READY_PREFIX, type BridgeReady } from "../shared/protocol";
+import { MIN_NODE_VERSION, supportsNodeVersion } from "../shared/runtime";
 
 const MAX_BODY = 64 * 1024 * 1024;
 const MAX_ERROR_TEXT = 500;
@@ -72,6 +73,9 @@ function send(res: ServerResponse, status: number, obj: unknown) {
 }
 
 export function startServer({ token, port = 0, fake = false }: { token: string; port?: number; fake?: boolean }) {
+	if (!supportsNodeVersion(process.versions.node)) {
+		throw new Error(`Node.js ${MIN_NODE_VERSION} or newer is required; found ${process.versions.node}. Install a supported LTS release from https://nodejs.org.`);
+	}
 	if (token.length < 32) throw new Error("TOPK_BRIDGE_TOKEN is required (at least 32 characters)");
 	const digest = crypto.createHash("sha256").update(token).digest();
 	const routes = createRoutes(fake ? new FakeBackend() : new TopKBackend()) as Record<string, (body: unknown) => unknown>;

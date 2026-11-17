@@ -7,6 +7,32 @@ import { cleanup } from './support/cleanup';
 
 afterEach(cleanup);
 
+test('Node discovery rejects old runtimes and falls back to a compatible installation', async () => {
+ let configuredVersion = 'v18.20.8';
+ let fallbackVersion: string | null = null;
+ const h = await harness({ subprocess: {
+  pathSearch: async () => '/mock/fallback-node',
+  call: async ({ command }) => {
+   let output = command === '/mock/configured-node' ? configuredVersion : fallbackVersion;
+   return { stdout: { readString: async () => { const chunk = output; output = null; return chunk; } }, wait: async () => ({ exitCode: 0 }) };
+  },
+ } });
+ h.setPref('nodePath', '/mock/configured-node');
+ h.files.set('/mock/configured-node', '');
+ h.files.set('/mock/fallback-node', '');
+ for (const version of ['v18.20.8', 'v20.20.0', 'v22.12.0', 'v22.13.0-rc.1', 'not a Node version']) {
+  configuredVersion = version;
+  await assert.rejects(h.bridge.findNode(), /Node.js 22\.13\.0 or newer was not found.*Settings/);
+ }
+ configuredVersion = 'v20.20.0';
+ fallbackVersion = 'v22.13.0\n';
+ assert.equal(await h.bridge.findNode(), '/mock/fallback-node');
+ for (const version of ['v22.13.0', 'v22.22.2', 'v24.0.0']) {
+  configuredVersion = version;
+  assert.equal(await h.bridge.findNode(), '/mock/configured-node');
+ }
+});
+
 test('leaving TopK mode invalidates the first pending search', async () => {
  const h = await harness(); const item = h.addItem(); const gate = defer<any[]>(); const filters: unknown[] = [];
  const win = { document: { getElementById: (id) => id === 'zotero-tb-search' ? { searchTextbox: { value:'query' } } : null }, ZoteroPane: { getSelectedLibraryIDs: () => [1], itemsView: { setFilter: async (...args) => filters.push(args) } } };
