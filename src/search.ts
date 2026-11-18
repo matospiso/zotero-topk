@@ -29,6 +29,8 @@ export class SearchIntegration {
 	public active = false;
 	public onResults: (() => void) | null = null;
 	private seq = 0;
+	private viewUpdates: Promise<void> = Promise.resolve();
+	private pendingSearch: { timer: ReturnType<typeof setTimeout>; resolve: () => void } | null = null;
 	public columnKey: string | false = false;
 	private prefObserver: any = null;
 	private patched = new Map<any, any>();
@@ -156,24 +158,37 @@ export class SearchIntegration {
 		const searchBox = win.document.getElementById("zotero-tb-search");
 		const text = String(searchBox?.searchTextbox?.value ?? "").trim();
 		const seq = ++this.seq;
-		if (!text) {
+		this.cancelPendingSearch();
+		if (!text || (!immediate && text.length < 3)) {
 			await this.clear(win);
 			return;
 		}
-		if (!immediate && text.length < 3) return;
 		this.spinner(win, true);
 		try {
+			if (!immediate) {
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(() => {
+						this.pendingSearch = null;
+						resolve();
+					}, 300);
+					this.pendingSearch = { timer, resolve };
+				});
+			}
+			if (seq !== this.seq) return;
 			const libraryIDs = selectedLibraryIDs(pane);
 			const limit = getPref("resultLimit");
 			const hits = await this.bridge.search(text, { limit, libraryIDs });
 			if (seq !== this.seq) return; // superseded by newer input
-			this.lastQuery = text;
-			this.applyHits(hits);
-			await this.applyFilter(win, libraryIDs, seq);
-			if (seq !== this.seq) return;
-			this.active = true;
-			pane.clearItemsPaneMessage?.();
-			log(`search “${text}”: ${hits.length} page hit(s), ${this.results.size} item(s)`);
+			await this.updateView(async () => {
+				if (seq !== this.seq || pane.itemsView !== itemsView) return;
+				this.lastQuery = text;
+				this.applyHits(hits);
+				await this.applyFilter(itemsView, libraryIDs, seq);
+				if (seq !== this.seq) return;
+				this.active = true;
+				pane.clearItemsPaneMessage?.();
+				log(`search “${text}”: ${hits.length} page hit(s), ${this.results.size} item(s)`);
+			});
 		}
 		catch (e) {
 			if (seq !== this.seq) return;
@@ -190,6 +205,20 @@ export class SearchIntegration {
 		finally {
 			if (seq === this.seq) this.spinner(win, false);
 		}
+	}
+
+	private cancelPendingSearch() {
+		if (!this.pendingSearch) return;
+		clearTimeout(this.pendingSearch.timer);
+		this.pendingSearch.resolve();
+		this.pendingSearch = null;
+	}
+
+	private updateView(update: () => Promise<void>): Promise<void> {
+		// Sequence checks cannot undo a refresh already in progress. Finish it before applying newer results or clearing.
+		const next = this.viewUpdates.then(update);
+		this.viewUpdates = next.catch(() => {});
+		return next;
 	}
 
 	private applyHits(hits: SearchHit[]) {
@@ -223,8 +252,7 @@ export class SearchIntegration {
 		this.onResults?.();
 	}
 
-	private async applyFilter(win: any, libraryIDs: number[], seq: number) {
-		const itemsView = win.ZoteroPane.itemsView;
+	private async applyFilter(itemsView: any, libraryIDs: number[], seq: number) {
 		const search = new Zotero.Search();
 		search.name = "TopK results";
 		search.libraryID = libraryIDs[0] ?? Zotero.Libraries.userLibraryID;
@@ -242,18 +270,21 @@ export class SearchIntegration {
 		this.active = true;
 		await itemsView.setFilter("advanced-search", search);
 		if (seq !== this.seq) return;
-		this.sortByScore(itemsView);
+		await this.sortByScore(itemsView);
+		if (seq !== this.seq) return;
 		try { itemsView.tree?.invalidate(); } catch (e) {}
 	}
 
-	private sortByScore(itemsView: any) {
+	private async sortByScore(itemsView: any) {
 		try {
 			const cols = itemsView._getColumns();
 			const index = cols.findIndex((c: any) => c.dataKey === this.columnKey);
 			if (index < 0) return;
-			if (cols[index].hidden) itemsView.tree._columns.toggleHidden(index);
+			if (cols[index].hidden) await itemsView.tree._columns.toggleHidden(index);
 			const col = itemsView._getColumns()[index];
-			if (!col.sortDirection) itemsView.tree._columns.toggleSort(index);
+			if (!col.sortDirection) await itemsView.tree._columns.toggleSort(index);
+			itemsView.invalidateRowCache(true);
+			await itemsView.sort();
 		}
 		catch (e) {
 			logError("sortByScore", e);
@@ -262,14 +293,19 @@ export class SearchIntegration {
 
 	async clear(win: any) {
 		this.seq++;
-		const hadFilter = this.active;
-		this.active = false;
-		this.results.clear();
-		this.byAttachment.clear();
-		this.onResults?.();
+		this.cancelPendingSearch();
 		this.spinner(win, false);
+		const itemsView = win.ZoteroPane.itemsView;
 		try {
-			if (hadFilter) await win.ZoteroPane.itemsView?.setFilter("advanced-search", null);
+			await this.updateView(async () => {
+				const hadFilter = this.active;
+				this.active = false;
+				this.lastQuery = "";
+				this.results.clear();
+				this.byAttachment.clear();
+				this.onResults?.();
+				if (hadFilter) await itemsView?.setFilter("advanced-search", null);
+			});
 		}
 		catch (e) {
 			logError("clear", e);
