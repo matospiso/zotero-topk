@@ -63,11 +63,8 @@ runtime. See [runtime boundaries](docs/architecture.md#runtime-boundaries).
 
 ## Getting started
 
-1. Download an XPI from [Releases](https://github.com/matospiso/zotero-topk/releases)
-   when available, or use a successful
-   [Test and build XPI run](https://github.com/matospiso/zotero-topk/actions/workflows/build.yml).
-   Each run has a **Download the XPI** link in its summary; CI downloads require
-   GitHub sign-in and expire after 30 days. You can also [build from source](docs/development.md).
+1. Open the [latest release](https://github.com/matospiso/zotero-topk/releases/latest)
+   and download `zotero-topk-<version>.xpi` from **Assets**.
 2. In Zotero, open **Tools → Plugins → ⚙ → Install Plugin From File…** and select
    `zotero-topk-<version>.xpi`.
 3. Open **Settings → TopK Semantic Search**. To index only attachments you choose,
