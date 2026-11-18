@@ -3,12 +3,12 @@
     "zotero-topk@topk.io": {
       "updates": [
         {
-          "version": "0.1.0",
-          "update_link": "https://github.com/matospiso/zotero-topk/releases/download/v0.1.0/zotero-topk-0.1.0.xpi",
-          "update_hash": "sha256:2ecb97051bc223e222d91ba802ed98e6900efd779be420bb2ef4ba8f2ea62b64",
+          "version": "0.1.1",
+          "update_link": "https://github.com/matospiso/zotero-topk/releases/download/v0.1.1/zotero-topk-0.1.1.xpi",
+          "update_hash": "sha256:608126bcd7b7e5f23d3e7d18ecc6384b5eb44bdf43dfc60e3b5b16439860f772",
           "applications": {
             "zotero": {
-              "strict_min_version": "7.0",
+              "strict_min_version": "10.0",
               "strict_max_version": "10.0.*"
             }
           }
