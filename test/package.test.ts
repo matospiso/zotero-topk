@@ -29,6 +29,8 @@ test("XPI exposes Zotero lifecycle callbacks and compiled default preferences", 
 	vm.runInNewContext(readFileSync(join(extracted, "prefs.js"), "utf8"), { pref: (key: string, value: unknown) => prefs.set(key, value) });
 	assert.equal(prefs.get("extensions.zotero-topk.nodePath"), "");
 	assert.equal(prefs.get("extensions.zotero-topk.autoIndex"), false);
+	const manifest = JSON.parse(readFileSync(join(extracted, "manifest.json"), "utf8"));
+	assert.equal(manifest.applications.zotero.strict_min_version, "10.0");
 	assert.equal(prefs.get("extensions.zotero-topk.uploadConcurrency"), 4);
 	assert.equal(prefs.has("extensions.zotero-topk.bunPath"), false);
 	const renderer = readFileSync(join(extracted, "content/renderer.js"), "utf8");
