@@ -14,7 +14,7 @@ export async function bundleAPI(dev = false) {
 const bundle = await bundleAPI();
 
 export async function harness({ backend = new FakeBackend(), files = new Map<string, string>(), groupLocalID = 2, subprocess = {} }: { backend?: any; files?: Map<string, string>; groupLocalID?: number; subprocess?: any } = {}) {
- const prefs = new Map<string, any>(Object.entries({ apiKey: 'account-a', region: 'test', host: '', collection: 'pages', bridgeFake: true, uploadBatch: 1, autoIndex: false }).map(([k,v]) => ['extensions.zotero-topk.' + k,v]));
+ const prefs = new Map<string, any>(Object.entries({ apiKey: 'account-a', region: 'test', host: '', collection: 'pages', bridgeFake: true, uploadBatch: 1 }).map(([k,v]) => ['extensions.zotero-topk.' + k,v]));
  const observers = new Map(); const timers = new Map(); const items = new Map();
  const libraries = [{ libraryID: 1, libraryType: 'user' }, { libraryID: groupLocalID, libraryType: 'group' }];
  const Zotero: any = {

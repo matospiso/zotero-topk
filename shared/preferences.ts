@@ -15,7 +15,7 @@ const DESTINATION_DEFAULTS = {
 export const DEFAULT_PREFS = {
 	...DESTINATION_DEFAULTS,
 	nodePath: "",
-	autoIndex: true,
+	autoIndex: false,
 	indexSnapshots: true,
 	maxPages: 500,
 	maxFileMB: 200,

@@ -15,9 +15,8 @@ open a matching paper and jump to the relevant PDF page.
 > month**. Writes, queries, and data retrieval also incur charges; see
 > [current pricing](https://www.topk.io/pricing).
 >
-> Automatic indexing is enabled by default: connecting can start uploading
-> existing PDFs and snapshots from your personal and group libraries. To choose
-> what gets uploaded, turn it off before entering your API key (see
+> Automatic indexing is off by default. Choose which attachments to index, or
+> opt in to automatic indexing of your personal and group libraries (see
 > [Getting started](#getting-started)).
 
 [Getting started](#getting-started) · [Configuration](docs/configuration.md) ·
@@ -46,8 +45,8 @@ In the video:
   with a sortable relevance-score column.
 - **Visual results:** a *TopK pages* item-pane section with thumbnails and links
   that open PDFs at the matching page.
-- **Background indexing:** new and changed PDF/snapshot attachments are indexed
-  automatically; trashed and deleted attachments are removed from the index.
+- **Optional background indexing:** automatically index new and changed
+  PDF/snapshot attachments; trashed and deleted attachments are removed from the index.
 - **Index management:** settings and menu actions to check connectivity, index
   selected attachments, rebuild a library, and remove indexed items.
 
@@ -67,11 +66,9 @@ runtime. See [runtime boundaries](docs/architecture.md#runtime-boundaries).
    and download `zotero-topk-<version>.xpi` from **Assets**.
 2. In Zotero, open **Tools → Plugins → ⚙ → Install Plugin From File…** and select
    `zotero-topk-<version>.xpi`.
-3. Open **Settings → TopK Semantic Search**. To index only attachments you choose,
-   uncheck **Automatically index new PDFs and snapshots** before entering your
-   API key. Leaving it enabled also includes existing attachments in your
-   personal and group libraries; there is no separate upload-consent dialog or
-   cost estimate.
+3. Open **Settings → TopK Semantic Search**. **Automatically index new PDFs and
+   snapshots** is off by default. Enable it only if you want automatic indexing,
+   including existing attachments in your personal and group libraries.
 4. Enter your API key, region, and collection, then click **Test connection**.
    The helper installs its pinned SDK on first use. If automatic indexing is
    enabled, a successful connection starts indexing your libraries. Otherwise,
@@ -83,6 +80,9 @@ runtime. See [runtime boundaries](docs/architecture.md#runtime-boundaries).
 If Node.js cannot be discovered, select its executable in settings.
 
 ## Indexing behavior and limits
+
+Automatic indexing is off by default. Existing explicitly saved settings are
+preserved on upgrade; check the setting if you used an earlier version.
 
 With automatic indexing enabled, the plugin checks existing libraries at startup
 and indexes new or changed PDF and snapshot attachments. **Index new documents
