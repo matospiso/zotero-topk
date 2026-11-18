@@ -52,7 +52,8 @@ In the video:
 
 ## Requirements
 
-- **Zotero 7–10.0.x**, matching the versions declared in the plugin manifest.
+- **Zotero 10.0.x** (tested with 10.0.9). Earlier versions lack the search-filter API
+  used by this plugin.
 - **[Node.js 22.13.0+](https://nodejs.org/) and npm** for the local helper process.
   Use the latest patch of a supported LTS release; Node.js 18 and 20 are end-of-life.
 - **[A TopK account and API key](https://console.topk.io/)**, plus network access.
