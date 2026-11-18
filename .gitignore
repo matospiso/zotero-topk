@@ -1,0 +1,8 @@
+node_modules/
+build/
+.zotero-dev/
+bridge/node_modules/
+*.log
+.env
+test/papers/*.pdf
+.env.*

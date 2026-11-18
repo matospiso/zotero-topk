@@ -1,0 +1,35 @@
+{
+  "name": "zotero-topk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Semantic (visual) search over PDF and web-snapshot pages in Zotero, powered by TopK's semantic index",
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "dev": "tsx scripts/build.ts --dev",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.tools.json && tsc --noEmit -p tsconfig.test.json",
+    "start": "tsx scripts/build.ts --dev && tsx scripts/run-zotero.ts",
+    "e2e": "tsx scripts/e2e.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "pdfjs-dist": "^6.2.108",
+    "typescript": "^5.9.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "@types/node": "^22.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matospiso/zotero-topk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/matospiso/zotero-topk/issues"
+  },
+  "homepage": "https://github.com/matospiso/zotero-topk#readme",
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

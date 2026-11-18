@@ -1,0 +1,113 @@
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, chmodSync, createWriteStream } from "node:fs";
+import { join, relative, isAbsolute, resolve } from "node:path";
+import { root, addonID, addonDir } from "./project";
+import { spawn } from "node:child_process";
+
+const args = process.argv.slice(2);
+if (args.some((arg) => arg === "--apikey" || arg.startsWith("--apikey="))) {
+	console.error("--apikey is no longer supported; use TOPK_API_KEY in the environment instead.");
+	process.exit(2);
+}
+const flag = (name: string) => args.includes(name);
+const opt = (name: string, def = "") => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
+
+const zoteroBin = process.env.ZOTERO_BIN || opt("--zotero");
+if (!zoteroBin || !existsSync(zoteroBin)) {
+	console.error("Set ZOTERO_BIN (or --zotero) to the Zotero executable");
+	process.exit(2);
+}
+const devDir = resolve(opt("--dev-dir", join(root, ".zotero-dev")));
+const profile = resolve(opt("--profile", join(devDir, "profile")));
+const data = resolve(opt("--data", join(devDir, "data")));
+const fresh = flag("--fresh");
+// user.js below disables add-on signing and enables the remote debugger: never write that into a real profile.
+for (const [name, dir] of [["--profile", profile], ["--data", data]]) {
+	const inside = relative(devDir, dir);
+	if ((!inside || inside === ".." || inside.startsWith("../") || inside.startsWith("..\\") || isAbsolute(inside)) && !flag("--allow-external-dirs")) {
+		console.error(`${name} ${dir} is outside the dev directory ${devDir}; pass --allow-external-dirs if you really mean it`);
+		process.exit(2);
+	}
+}
+if (fresh) {
+	rmSync(profile, { recursive: true, force: true });
+	rmSync(data, { recursive: true, force: true });
+}
+mkdirSync(join(profile, "extensions"), { recursive: true, mode: 0o700 });
+mkdirSync(data, { recursive: true, mode: 0o700 });
+chmodSync(profile, 0o700);
+
+const extDir = join(profile, "extensions");
+rmSync(join(extDir, addonID), { force: true });
+rmSync(join(extDir, addonID + ".xpi"), { force: true });
+if (opt("--xpi")) {
+	cpSync(resolve(opt("--xpi")), join(extDir, addonID + ".xpi"));
+}
+else {
+	// Proxy file: tells the add-on manager to load the plugin from the build directory.
+	writeFileSync(join(extDir, addonID), addonDir + "/");
+}
+// Force the add-on manager to rescan.
+const prefsFile = join(profile, "prefs.js");
+if (existsSync(prefsFile)) {
+	writeFileSync(prefsFile, readFileSync(prefsFile, "utf8").split("\n")
+		.filter((l) => !/extensions\.lastAppBuildId|extensions\.lastAppVersion/.test(l)).join("\n"));
+}
+const prefs: Record<string, string | boolean | number> = {
+	"extensions.zotero.firstRun2": false,
+	"extensions.zotero.firstRunGuidance": false,
+	"extensions.zotero.dataDir": data,
+	"extensions.zotero.useDataDir": true,
+	"extensions.zotero.debug.log": true,
+	"extensions.zotero.automaticScraperUpdates": false,
+	"extensions.zotero.sync.autoSync": false,
+	"extensions.zotero.sync.server.compressData": false,
+	"extensions.zotero-topk.debug": true,
+	"app.update.enabled": false,
+	"browser.dom.window.dump.enabled": true,
+	"devtools.debugger.remote-enabled": true,
+	"devtools.debugger.prompt-connection": false,
+	"xpinstall.signatures.required": false,
+	"extensions.autoDisableScopes": 0,
+	"extensions.enabledScopes": 15,
+};
+if (flag("--fake")) prefs["extensions.zotero-topk.bridgeFake"] = true;
+if (opt("--selftest")) prefs["extensions.zotero-topk.selftest"] = resolve(opt("--selftest"));
+const apiKey = process.env.TOPK_API_KEY;
+if (apiKey) prefs["extensions.zotero-topk.apiKey"] = apiKey;
+if (opt("--collection")) prefs["extensions.zotero-topk.collection"] = opt("--collection");
+if (opt("--region")) prefs["extensions.zotero-topk.region"] = opt("--region");
+if (opt("--host")) prefs["extensions.zotero-topk.host"] = opt("--host");
+prefs["extensions.zotero-topk.nodePath"] = opt("--node") || process.execPath;
+const userPrefsPath = join(profile, "user.js");
+// writeFileSync's mode only applies to new files. Tighten an existing profile
+// before writing credentials, and stop if its permissions cannot be changed.
+if (existsSync(userPrefsPath)) chmodSync(userPrefsPath, 0o600);
+writeFileSync(userPrefsPath,
+	Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`).join("\n") + "\n",
+	{ mode: 0o600 });
+
+const env = { ...process.env };
+delete env.TOPK_API_KEY; // Zotero reads it from user.js; keep it out of the Zotero process environment
+if (flag("--headless")) env.MOZ_HEADLESS = "1";
+const zArgs = ["-profile", profile, "-no-remote", "-purgecaches"];
+if (flag("--debug") || flag("--headless")) zArgs.push("-ZoteroDebugText");
+if (flag("--jsconsole")) zArgs.push("-jsconsole");
+console.log(`launching ${zoteroBin} ${zArgs.join(" ")}`);
+const child = spawn(zoteroBin, zArgs, { env, stdio: ["ignore", "pipe", "pipe"] });
+const logPath = opt("--log", join(devDir, "zotero.log"));
+const logStream = createWriteStream(logPath);
+for (const s of [child.stdout, child.stderr]) {
+	s.on("data", (d) => {
+		logStream.write(d);
+		if (flag("--verbose")) process.stdout.write(d);
+	});
+}
+child.on("error", (error) => {
+	console.error(`could not launch Zotero: ${error.message}`);
+});
+child.on("close", (code, signal) => {
+	logStream.end(() => {
+		console.log(`zotero exited with ${signal || code}; log at ${logPath}`);
+		process.exitCode = code ?? 1;
+	});
+});
