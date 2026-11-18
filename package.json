@@ -1,6 +1,6 @@
 {
   "name": "zotero-topk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Semantic (visual) search over PDF and web-snapshot pages in Zotero, powered by TopK's semantic index",
