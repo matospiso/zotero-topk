@@ -15,7 +15,7 @@ Advanced preferences use the `extensions.zotero-topk.` prefix in Zotero's config
 | `host` | – (topk.io) | advanced: API host; the endpoint is `https://<region>.api.<host>` |
 | `collection` | `zotero-pages` | collection name (created if missing) |
 | `nodePath` | auto | Node.js executable |
-| `autoIndex` | `true` | index new/changed attachments automatically |
+| `autoIndex` | `false` | opt in to indexing existing and new/changed attachments automatically |
 | `indexSnapshots` | `true` | include HTML snapshots (printed to A4 pages) |
 | `maxPages` | `500` | pages per document |
 | `maxFileMB` | `200` | attachments larger than this are skipped |
