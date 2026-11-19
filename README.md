@@ -26,18 +26,14 @@ open a matching paper and jump to the relevant PDF page.
 
 ## See it in action
 
-https://github.com/user-attachments/assets/dd2c39e5-5ddb-4fab-a8eb-22318b8c9e49
+Search is all about the details. **"Mirror selfie at the gym"** finds a tiny
+thumbnail inside a phone screenshot embedded in a PDF page, among hundreds of
+papers in a Zotero library.
 
-*A short demo (about 1.5 minutes).*
+https://github.com/user-attachments/assets/4086a475-1531-47c2-b51a-605267efbf77
 
-In the video:
-
-1. Pick **TopK semantic (pages)** in Zotero's search bar.
-2. Type what you're looking for in plain words. It doesn't need to match the
-   exact text in the paper.
-3. Zotero lists the papers that fit best, with a **TopK score** for each.
-4. Open a result to see the matching pages, then click a page to jump straight
-   to it in the PDF.
+More examples: ["Loss curve … with a sudden spike"](#loss-curve-with-a-sudden-spike)
+· [Kernels: from query to PDF page](#kernels-from-query-to-pdf-page).
 
 ## Features
 
@@ -79,6 +75,22 @@ runtime. See [runtime boundaries](docs/architecture.md#runtime-boundaries).
    a page to jump to it in the PDF.
 
 If Node.js cannot be discovered, select its executable in settings.
+
+## More examples
+
+### Loss curve with a sudden spike
+
+Start with **"loss curve"**, then add **"with a sudden spike"**. The top result
+changes from a smooth training-loss plot to a figure with a sharp spike.
+
+https://github.com/user-attachments/assets/7c1810d6-4336-4b36-aec2-1be6e76de38b
+
+### Kernels: from query to PDF page
+
+A longer walkthrough (about 1.5 minutes): search in plain words, compare TopK
+scores, and jump from a matching page thumbnail straight into the PDF.
+
+https://github.com/user-attachments/assets/dd2c39e5-5ddb-4fab-a8eb-22318b8c9e49
 
 ## Indexing behavior and limits
 
