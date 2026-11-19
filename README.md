@@ -33,7 +33,7 @@ papers in a Zotero library.
 https://github.com/user-attachments/assets/4086a475-1531-47c2-b51a-605267efbf77
 
 More examples: ["Loss curve … with a sudden spike"](#loss-curve-with-a-sudden-spike)
-· [Kernels: from query to PDF page](#kernels-from-query-to-pdf-page).
+· [Various results for "kernels"](#various-results-for-kernels).
 
 ## Features
 
@@ -85,7 +85,7 @@ changes from a smooth training-loss plot to a figure with a sharp spike.
 
 https://github.com/user-attachments/assets/7c1810d6-4336-4b36-aec2-1be6e76de38b
 
-### Kernels: from query to PDF page
+### Various results for "kernels"
 
 A longer walkthrough (about 1.5 minutes): search in plain words, compare TopK
 scores, and jump from a matching page thumbnail straight into the PDF.
